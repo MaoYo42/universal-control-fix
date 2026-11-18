@@ -11,7 +11,7 @@
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
 
@@ -1053,6 +1053,56 @@ cmd_log() {
   echo
 }
 
+# ─────────────────── 鼠标手感（iPad 侧） ───────────────────
+#
+# 通用控制下，鼠标在 iPad 上的手感**不由 Mac 决定**。
+# Mac 只负责把指针/滚动事件转发过去，怎么解释这些事件是 iPadOS 的事。
+# 所以调 Mac 的设置没用，得去 iPad 上调。
+#
+# 实测有效的两条（本机验证过）：
+#   1. iPad「自然滚动」要和 Mac 的一致，否则滚轮方向相反
+#   2. iPad 指针速度拉到最快、关掉指针加速度，滚轮才线性
+
+cmd_mouse() {
+  echo
+  printf "%s鼠标与滚动%s\n\n" "$BOLD" "$RST"
+
+  # 自然滚动：键不存在时系统默认开启
+  local nat
+  nat=$(/usr/bin/defaults read -g com.apple.swipescrolldirection 2>/dev/null)
+  if [ -z "$nat" ]; then
+    printf "  %s自然滚动（Mac）：开启%s（默认）\n" "$GRN" "$RST"
+  elif [ "$nat" = "1" ]; then
+    printf "  %s自然滚动（Mac）：开启%s\n" "$GRN" "$RST"
+  else
+    printf "  %s自然滚动（Mac）：关闭%s\n" "$YEL" "$RST"
+  fi
+
+  local ms; ms=$(/usr/bin/defaults read -g com.apple.mouse.scaling 2>/dev/null)
+  local ts; ts=$(/usr/bin/defaults read -g com.apple.trackpad.scaling 2>/dev/null)
+  printf "  %s指针速度（Mac）：鼠标 %s · 触控板 %s%s\n" \
+    "$DIM" "${ms:-默认}" "${ts:-默认}" "$RST"
+
+  local ws; ws=$(/usr/bin/defaults read -g com.apple.scrollwheel.scaling 2>/dev/null)
+  [ -n "$ws" ] && printf "  %s滚轮加速（Mac）：%s%s\n" "$DIM" "$ws" "$RST"
+
+  echo
+  printf "%s通用控制下，iPad 上的手感由 iPad 自己的设置决定%s\n" "$BOLD" "$RST"
+  printf "  %sMac 这边怎么调都不影响 iPad，只影响 Mac 本地%s\n\n" "$DIM" "$RST"
+
+  printf "  %s1%s 设置 → 通用 → 触控板与鼠标 → %s自然滚动%s\n" "$CYA" "$RST" "$BOLD" "$RST"
+  printf "      %s和上面 Mac 的值保持一致。不一致就会反向。%s\n" "$DIM" "$RST"
+  printf "      %s实测：Mac 开着自然滚动时，iPad 关掉才是同一个方向。%s\n\n" "$DIM" "$RST"
+
+  printf "  %s2%s 设置 → 辅助功能 → 指针控制\n" "$CYA" "$RST"
+  printf "      %s跟踪速度拉到最快，关掉「指针加速度」%s\n" "$DIM" "$RST"
+  printf "      %s加速度开着时滚轮会「一顿一顿」，关掉后线性得多%s\n\n" "$DIM" "$RST"
+
+  printf "  %s3%s 还是不顺的话：%s换触控板%s\n" "$CYA" "$RST" "$BOLD" "$RST"
+  printf "      %s滚轮是离散步进，iPadOS 不做插值；触控板走手势，iPadOS 原生处理%s\n" "$DIM" "$RST"
+  echo
+}
+
 # ─────────────────────── 守候服务 ───────────────────────
 
 UC_PLIST="$HOME/Library/LaunchAgents/local.uc.watch.plist"
@@ -1134,6 +1184,7 @@ usage() {
     uc fix                  重置通用控制（结束进程，系统会自动拉起）
     uc watch [秒]           守候模式，掉线或排列被打乱时自动恢复（默认 15 秒）
     uc agent on|off         开机自动守候的 launchd 服务
+    uc mouse                鼠标在 iPad 上的手感排查（滚轮反向 / 不顺）
     uc arrange save         把当前显示器排列存成快照
     uc arrange apply        把排列贴回快照
     uc arrange              查看排列与快照的差异
@@ -1157,6 +1208,7 @@ case "${1:-check}" in
   check|"")  cmd_check ;;
   fix|reset) cmd_fix ;;
   watch)     cmd_watch "$2" ;;
+  mouse)     cmd_mouse ;;
   agent)     cmd_agent "$2" ;;
   arrange)   shift; cmd_arrange "$@" ;;
   log)       cmd_log "$2" ;;

@@ -409,6 +409,10 @@ final class Controller: NSObject, NSMenuDelegate {
         shareItem.submenu = sub
         menu.addItem(shareItem)
 
+        let mouse = NSMenuItem(title: "鼠标手感排查…", action: #selector(showMouseHelp), keyEquivalent: "")
+        mouse.target = self
+        menu.addItem(mouse)
+
         let st = NSMenuItem(title: "打开通用控制设置", action: #selector(doOpenSettings), keyEquivalent: ",")
         st.target = self
         menu.addItem(st)
@@ -500,12 +504,47 @@ final class Controller: NSObject, NSMenuDelegate {
     }
     @objc func doQuit() { NSApp.terminate(nil) }
 
-    @objc func doOpenSettings() {
-        if let u = URL(string: kSettingsURL) { NSWorkspace.shared.open(u) }
+    /// 通用控制下，鼠标在 iPad 上的手感不由 Mac 决定。
+    /// Mac 只负责转发事件，怎么解释是 iPadOS 的事 —— 所以得去 iPad 上调。
+    @objc func showMouseHelp() {
+        let (_, out) = run("/usr/bin/defaults", ["read", "-g", "com.apple.swipescrolldirection"], timeout: 3)
+        let v = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let macNatural: String
+        if v.isEmpty { macNatural = "开启（默认）" }
+        else { macNatural = (v == "1") ? "开启" : "关闭" }
+
+        let a = NSAlert()
+        a.messageText = "iPad 上的鼠标手感由 iPad 自己决定"
+        a.informativeText = """
+        Mac 只负责把指针和滚动事件转发过去，改 Mac 这边的设置不影响 iPad。
+
+        当前 Mac 的「自然滚动」：\(macNatural)
+
+        ① 设置 → 通用 → 触控板与鼠标 → 自然滚动
+           两边不一致滚轮就会反向。
+           实测：Mac 开着自然滚动时，iPad 关掉才是同一个方向。
+
+        ② 设置 → 辅助功能 → 指针控制
+           跟踪速度拉到最快，关掉「指针加速度」。
+           加速度开着时滚轮会一顿一顿，关掉后线性得多。
+
+        ③ 还是不顺就换触控板
+           滚轮是离散步进，iPadOS 不做插值；
+           触控板走的是手势，iPadOS 按原生方式处理，惯性正常。
+        """
+        a.addButton(withTitle: "知道了")
+        a.addButton(withTitle: "复制成文本")
+        if a.runModal() == .alertSecondButtonReturn {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(a.informativeText, forType: .string)
+        }
     }
 
-    @objc func showShortcutHelp() {
-        let a = NSAlert()
+    @objc func doOpenSettings() {        if let u = URL(string: kSettingsURL) { NSWorkspace.shared.open(u) }
+    }
+
+    @objc func showShortcutHelp() {        let a = NSAlert()
         a.messageText = "需要先建两个快捷指令"
         a.informativeText = """
         系统只通过 App Intent 暴露「共享键盘和鼠标」开关，没有别的调用方式。
