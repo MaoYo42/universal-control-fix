@@ -11,7 +11,7 @@
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
 
@@ -1057,11 +1057,14 @@ cmd_log() {
 #
 # 通用控制下，鼠标在 iPad 上的手感**不由 Mac 决定**。
 # Mac 只负责把指针/滚动事件转发过去，怎么解释这些事件是 iPadOS 的事。
-# 所以调 Mac 的设置没用，得去 iPad 上调。
 #
-# 实测有效的两条（本机验证过）：
-#   1. iPad「自然滚动」要和 Mac 的一致，否则滚轮方向相反
-#   2. iPad 指针速度拉到最快、关掉指针加速度，滚轮才线性
+# 苹果把鼠标设置散在三个地方，这是公认的痛点：
+#   通用 → 触控板与鼠标          只有 3 项
+#   无障碍 → 指针控制            滚动速度 / 跟踪速度 / 指针加速度 / 指针动画
+#   无障碍 → 触控 → 辅助触控     指针设备 → 追踪灵敏度 / 自定义按钮
+#
+# 其中「滚动速度」默认只有滑条的 1/3，是最容易被漏掉、又最影响手感的一项。
+# iPadOS 26 起「辅助功能」改名叫「无障碍」，路径按新名字写。
 
 cmd_mouse() {
   echo
@@ -1088,18 +1091,30 @@ cmd_mouse() {
 
   echo
   printf "%s通用控制下，iPad 上的手感由 iPad 自己的设置决定%s\n" "$BOLD" "$RST"
-  printf "  %sMac 这边怎么调都不影响 iPad，只影响 Mac 本地%s\n\n" "$DIM" "$RST"
+  printf "  %sMac 这边怎么调都不影响 iPad，只影响 Mac 本地%s\n" "$DIM" "$RST"
+  printf "  %s苹果把鼠标设置散在三个地方，按这个顺序调：%s\n\n" "$DIM" "$RST"
 
-  printf "  %s1%s 设置 → 通用 → 触控板与鼠标 → %s自然滚动%s\n" "$CYA" "$RST" "$BOLD" "$RST"
-  printf "      %s和上面 Mac 的值保持一致。不一致就会反向。%s\n" "$DIM" "$RST"
-  printf "      %s实测：Mac 开着自然滚动时，iPad 关掉才是同一个方向。%s\n\n" "$DIM" "$RST"
+  printf "  %s①%s 设置 → 通用 → 触控板与鼠标\n" "$CYA" "$RST"
+  printf "      %s自然滚动%s  和上面 Mac 的值保持一致，不一致就会反向\n" "$BOLD" "$RST"
+  printf "      %s实测：Mac 开着自然滚动时，iPad 关掉才是同一个方向%s\n\n" "$DIM" "$RST"
 
-  printf "  %s2%s 设置 → 辅助功能 → 指针控制\n" "$CYA" "$RST"
-  printf "      %s跟踪速度拉到最快，关掉「指针加速度」%s\n" "$DIM" "$RST"
-  printf "      %s加速度开着时滚轮会「一顿一顿」，关掉后线性得多%s\n\n" "$DIM" "$RST"
+  printf "  %s②%s 设置 → 无障碍（旧版叫「辅助功能」）→ 指针控制\n" "$CYA" "$RST"
+  printf "      %s滚动速度%s    最容易被漏掉的一项。默认只有滑条的 1/3，\n" "$BOLD" "$RST"
+  printf "                  %s拉到最右，滚一格才真的走得动%s\n" "$DIM" "$RST"
+  printf "      %s跟踪速度%s    拉到最快\n" "$BOLD" "$RST"
+  printf "      %s指针加速度%s  关掉。开着时滚轮会被叠一层非线性放大，一顿一顿\n" "$BOLD" "$RST"
+  printf "      %s指针动画%s    关掉。光标就不会被 App 图标「吸」进去找不着\n\n" "$BOLD" "$RST"
 
-  printf "  %s3%s 还是不顺的话：%s换触控板%s\n" "$CYA" "$RST" "$BOLD" "$RST"
-  printf "      %s滚轮是离散步进，iPadOS 不做插值；触控板走手势，iPadOS 原生处理%s\n" "$DIM" "$RST"
+  printf "  %s③%s 设置 → 无障碍 → 触控 → 辅助触控 → 指针设备\n" "$CYA" "$RST"
+  printf "      %s追踪灵敏度%s  ② 调完还嫌慢的话，这里能再快一档\n" "$BOLD" "$RST"
+  printf "      %s设备 → 点开你的鼠标 → 自定义按钮%s\n" "$BOLD" "$RST"
+  printf "                  %s可以绑截屏、通知中心、控制中心、快捷指令%s\n\n" "$DIM" "$RST"
+
+  printf "  %s④%s 还是不顺就换触控板\n" "$CYA" "$RST"
+  printf "      %s滚轮是离散步进，iPadOS 不做插值；触控板走手势，原生处理%s\n" "$DIM" "$RST"
+  echo
+  printf "  %sApp Store 上没有能改这件事的软件——iPadOS 不开放系统级输入拦截，%s\n" "$DIM" "$RST"
+  printf "  %s第三方 App 只能处理自己窗口里的输入，改不了全系统的鼠标行为。%s\n" "$DIM" "$RST"
   echo
 }
 

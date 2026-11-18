@@ -506,6 +506,7 @@ final class Controller: NSObject, NSMenuDelegate {
 
     /// 通用控制下，鼠标在 iPad 上的手感不由 Mac 决定。
     /// Mac 只负责转发事件，怎么解释是 iPadOS 的事 —— 所以得去 iPad 上调。
+    /// 苹果把这几项散在三个地方，按顺序走一遍。
     @objc func showMouseHelp() {
         let (_, out) = run("/usr/bin/defaults", ["read", "-g", "com.apple.swipescrolldirection"], timeout: 3)
         let v = out.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -517,20 +518,32 @@ final class Controller: NSObject, NSMenuDelegate {
         a.messageText = "iPad 上的鼠标手感由 iPad 自己决定"
         a.informativeText = """
         Mac 只负责把指针和滚动事件转发过去，改 Mac 这边的设置不影响 iPad。
-
         当前 Mac 的「自然滚动」：\(macNatural)
 
-        ① 设置 → 通用 → 触控板与鼠标 → 自然滚动
-           两边不一致滚轮就会反向。
-           实测：Mac 开着自然滚动时，iPad 关掉才是同一个方向。
+        苹果把鼠标设置散在三个地方，按这个顺序走一遍：
 
-        ② 设置 → 辅助功能 → 指针控制
-           跟踪速度拉到最快，关掉「指针加速度」。
-           加速度开着时滚轮会一顿一顿，关掉后线性得多。
+        ① 设置 → 通用 → 触控板与鼠标
+           自然滚动：和上面 Mac 的值保持一致，不一致就会反向。
+           实测 Mac 开着自然滚动时，iPad 要关掉才是同一方向。
 
-        ③ 还是不顺就换触控板
+        ② 设置 → 无障碍（旧版叫「辅助功能」）→ 指针控制
+           · 滚动速度 ← 最容易漏的一项，默认只有滑条的 1/3，
+             拉到最右边，滚一格才真的走得动
+           · 跟踪速度：拉到最快
+           · 指针加速度：关掉，开着时滚轮会一顿一顿
+           · 指针动画：关掉，光标就不会被 App 图标吸进去
+
+        ③ 设置 → 无障碍 → 触控 → 辅助触控 → 指针设备
+           · 追踪灵敏度：② 调完还嫌慢的话，这里能再快一档
+           · 设备 → 点开你的鼠标 → 自定义按钮
+             （可绑截屏、通知中心、控制中心、快捷指令）
+
+        ④ 还是不顺就换触控板
            滚轮是离散步进，iPadOS 不做插值；
-           触控板走的是手势，iPadOS 按原生方式处理，惯性正常。
+           触控板走的是手势，iPadOS 按原生方式处理。
+
+        App Store 上没有能改这件事的软件：iPadOS 不开放系统级输入拦截，
+        第三方 App 只能处理自己窗口里的输入，改不了全系统的鼠标行为。
         """
         a.addButton(withTitle: "知道了")
         a.addButton(withTitle: "复制成文本")
