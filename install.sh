@@ -12,6 +12,7 @@ set -e
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/bin"
 DEST="$BIN_DIR/uc"
+DEST_DISPLAY="$BIN_DIR/ucdisplay"
 PLIST="$HOME/Library/LaunchAgents/local.uc.watch.plist"
 LOG_FILE="$HOME/Library/Logs/uc-watch.log"
 LABEL="local.uc.watch"
@@ -25,6 +26,10 @@ uninstall() {
   if [ -f "$DEST" ]; then
     rm -f "$DEST"
     echo "已删除 $DEST"
+  fi
+  if [ -f "$DEST_DISPLAY" ]; then
+    rm -f "$DEST_DISPLAY"
+    echo "已删除 $DEST_DISPLAY"
   fi
   echo "卸载完成"
   exit 0
@@ -77,6 +82,22 @@ esac
 mkdir -p "$BIN_DIR"
 install -m 755 "$SRC_DIR/uc" "$DEST"
 echo "已安装：$DEST"
+
+# 显示器排列组件（可选，缺了不影响体检/重置，只是没有 uc arrange）
+if [ -x "$SRC_DIR/tools/ucdisplay" ]; then
+  install -m 755 "$SRC_DIR/tools/ucdisplay" "$DEST_DISPLAY"
+  echo "已安装：$DEST_DISPLAY"
+elif command -v swiftc >/dev/null 2>&1 && [ -f "$SRC_DIR/tools/ucdisplay.swift" ]; then
+  if swiftc -O -o "$DEST_DISPLAY" "$SRC_DIR/tools/ucdisplay.swift" \
+       -framework CoreGraphics -framework AppKit 2>/dev/null; then
+    chmod 755 "$DEST_DISPLAY"
+    echo "已编译并安装：$DEST_DISPLAY"
+  else
+    echo "提示：ucdisplay 编译失败，uc arrange 相关功能不可用"
+  fi
+else
+  echo "提示：未找到 ucdisplay，uc arrange 相关功能不可用"
+fi
 
 # 确认 PATH 里有 ~/bin
 case ":$PATH:" in

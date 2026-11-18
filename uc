@@ -2,17 +2,23 @@
 #
 # uc — macOS 通用控制（Universal Control）体检与自愈
 #
-#   uc           体检报告
-#   uc fix       重置通用控制
-#   uc watch     后台守候，掉线自动恢复
-#   uc log       查看最近日志
+#   uc               体检报告
+#   uc fix           重置通用控制
+#   uc watch         后台守候，掉线自动恢复
+#   uc arrange       显示器排列快照（save / apply / auto）
+#   uc log           查看最近日志
 #
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
+
+# 显示器排列快照
+UC_CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uc"
+UC_ARRANGE="$UC_CFG_DIR/arrange.tsv"
+UC_NOAUTO="$UC_CFG_DIR/arrange.noauto"
 
 # launchd 启动时环境变量极简，显式补齐，保证 system_profiler 等能找到
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:$PATH"
@@ -328,6 +334,27 @@ cmd_check() {
     printf "  %s✓%s 未检测到活动的 VPN\n" "$GRN" "$RST"
   fi
 
+  # 显示器排列（重连后被打回默认是常见抱怨）
+  if [ -n "$(ucd_bin)" ]; then
+    if [ ! -f "$UC_ARRANGE" ]; then
+      printf "  %s·%s 显示器排列尚未保存快照\n" "$DIM" "$RST"
+      printf "      %s→ 摆好位置后执行 %suc arrange save%s%s，以后重连可一键贴回%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+    else
+      local apl; apl=$(arrange_plan)
+      if [ -z "$apl" ]; then
+        printf "  %s✓%s 显示器排列与快照一致\n" "$GRN" "$RST"
+      else
+        printf "  %s⚠%s 显示器排列与快照不一致\n" "$YEL" "$RST"
+        printf '%s\n' "$apl" | while IFS=$'\t' read -r _uuid _sx _sy _rest; do
+          [ -z "$_uuid" ] && continue
+          printf "      %s  快照 (%s, %s)  当前 (%s)\n" "$_uuid" "$_sx" "$_sy" "$_rest"
+        done
+        printf "      %s→ 执行 %suc arrange apply%s%s 还原%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+        risks=$((risks+1))
+      fi
+    fi
+  fi
+
   echo
   printf "%s────────────────────────────────────────────────%s\n" "$DIM" "$RST"
   if [ "$risks" -eq 0 ]; then
@@ -336,6 +363,190 @@ cmd_check() {
     printf "结论：%s 个风险项。处理后可执行 %suc fix%s 重置通用控制。\n" "$risks" "$CYA" "$RST"
   fi
   echo
+}
+
+# ─────────────────────── 显示器排列 ───────────────────────
+#
+# 重连、唤醒、显示器热插拔之后，macOS 常把副屏位置「重新居中」甚至丢到
+# 主屏外面。这里做的是：把理想排列存成快照，发现漂移就贴回去（永久写入）。
+
+# 找到 ucdisplay 二进制
+ucd_bin() {
+  if [ -n "$UC_DISPLAY" ] && [ -x "$UC_DISPLAY" ]; then printf '%s' "$UC_DISPLAY"; return 0; fi
+  local d=""
+  if [ -n "$0" ]; then d=$(cd "$(dirname "$0")" 2>/dev/null && pwd); fi
+  local c
+  for c in "$d/ucdisplay" "$d/tools/ucdisplay" "$HOME/bin/ucdisplay" \
+           "/usr/local/bin/ucdisplay" "/opt/homebrew/bin/ucdisplay"; do
+    if [ -x "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  command -v ucdisplay 2>/dev/null
+}
+
+arrange_tsv() {
+  local u; u=$(ucd_bin)
+  [ -z "$u" ] && return 1
+  "$u" list --tsv 2>/dev/null
+}
+
+# 任一显示器休眠时输出 yes。休眠状态下 WindowServer 拒绝一切排列变更。
+arrange_asleep() {
+  local u; u=$(ucd_bin)
+  if [ -z "$u" ]; then echo "no"; return 0; fi
+  local r; r=$("$u" asleep 2>/dev/null)
+  echo "${r:-no}"
+}
+
+# 输出：uuid \t 快照x \t 快照y \t 当前x,当前y  （只列有差异的）
+arrange_plan() {
+  [ -f "$UC_ARRANGE" ] || return 1
+  local cur; cur=$(mktemp /tmp/uc-arrange.XXXXXX) || return 1
+  arrange_tsv > "$cur" 2>/dev/null
+  awk -F'\t' '
+    NR == FNR { sx[$1] = $2; sy[$1] = $3; next }
+    ($1 in sx) && ($2 != sx[$1] || $3 != sy[$1]) {
+      printf "%s\t%s\t%s\t%s,%s\n", $1, sx[$1], sy[$1], $2, $3
+    }
+  ' "$UC_ARRANGE" "$cur"
+  rm -f "$cur"
+}
+
+# 按快照还原，还原台数写入 ARRANGE_RESTORED
+arrange_restore() {
+  ARRANGE_RESTORED=0
+  local plan; plan=$(arrange_plan)
+  [ -z "$plan" ] && return 0
+  local u; u=$(ucd_bin)
+  [ -z "$u" ] && return 1
+  local uuid sx sy rest
+  while IFS=$'\t' read -r uuid sx sy rest; do
+    [ -z "$uuid" ] && continue
+    if "$u" set "$uuid" "$sx" "$sy" --permanent >/dev/null 2>&1; then
+      printf "  %s  (%s) → (%s, %s)  %s✓%s\n" "$uuid" "$rest" "$sx" "$sy" "$GRN" "$RST"
+      ARRANGE_RESTORED=$((ARRANGE_RESTORED + 1))
+    else
+      printf "  %s  (%s) → (%s, %s)  %s✗%s\n" "$uuid" "$rest" "$sx" "$sy" "$RED" "$RST"
+    fi
+  done <<EOF
+$plan
+EOF
+}
+
+arrange_show() {
+  local u; u=$(ucd_bin)
+  if [ -z "$u" ]; then
+    printf "%s✗%s 找不到 ucdisplay 组件\n" "$RED" "$RST"
+    printf "  %s重新运行一次 install.sh 即可装上%s\n" "$DIM" "$RST"
+    return 1
+  fi
+
+  echo
+  printf "%s当前显示器排列%s\n\n" "$BOLD" "$RST"
+  "$u" list | tail -n +2
+
+  if [ ! -f "$UC_ARRANGE" ]; then
+    echo
+    printf "%s尚未保存快照%s\n" "$YEL" "$RST"
+    printf "  %s把显示器摆成你想要的样式后，执行：%suc arrange save%s\n" "$DIM" "$CYA" "$RST$DIM"
+    echo
+    return 0
+  fi
+
+  echo
+  local plan; plan=$(arrange_plan)
+  if [ -z "$plan" ]; then
+    printf "%s✓%s 与快照一致（快照时间 %s）\n" "$GRN" "$RST" "$(date -r "$UC_ARRANGE" '+%m-%d %H:%M')"
+  else
+    printf "%s⚠%s 与快照不一致（快照时间 %s）\n" "$YEL" "$RST" "$(date -r "$UC_ARRANGE" '+%m-%d %H:%M')"
+    printf '%s\n' "$plan" | while IFS=$'\t' read -r uuid sx sy rest; do
+      [ -z "$uuid" ] && continue
+      printf "    %s  快照 (%s, %s)  当前 (%s)\n" "$uuid" "$sx" "$sy" "$rest"
+    done
+    printf "  %s→ 执行 %suc arrange apply%s%s 还原%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+  fi
+
+  if [ -f "$UC_NOAUTO" ]; then
+    printf "  %s自动还原：已关闭%s\n" "$DIM" "$RST"
+  else
+    printf "  %s自动还原：开启（守候模式检测到重连后会自动贴回）%s\n" "$DIM" "$RST"
+  fi
+  echo
+}
+
+arrange_save() {
+  local u; u=$(ucd_bin)
+  if [ -z "$u" ]; then
+    printf "%s✗%s 找不到 ucdisplay 组件，请重新运行 install.sh\n" "$RED" "$RST"
+    return 1
+  fi
+  mkdir -p "$UC_CFG_DIR" || return 1
+  if ! arrange_tsv > "$UC_ARRANGE"; then
+    printf "%s✗%s 保存失败\n" "$RED" "$RST"
+    return 1
+  fi
+  local n; n=$(wc -l < "$UC_ARRANGE" | tr -d ' ')
+  printf "%s✓%s 已保存 %s 台显示器的排列 → %s\n" "$GRN" "$RST" "$n" "$UC_ARRANGE"
+  printf "  %s以后排列被打乱时，执行 %suc arrange apply%s%s 即可贴回%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+}
+
+arrange_apply() {
+  local u; u=$(ucd_bin)
+  if [ -z "$u" ]; then
+    printf "%s✗%s 找不到 ucdisplay 组件，请重新运行 install.sh\n" "$RED" "$RST"
+    return 1
+  fi
+  if [ ! -f "$UC_ARRANGE" ]; then
+    printf "%s✗%s 还没有快照，先摆好位置再执行 %suc arrange save%s\n" "$RED" "$RST" "$CYA" "$RST"
+    return 1
+  fi
+
+  # 休眠时系统会拒绝调整排列，先把屏幕叫醒
+  if [ "$(arrange_asleep)" = "yes" ]; then
+    printf "%s·%s 显示器休眠中，先唤醒屏幕…\n" "$YEL" "$RST"
+    caffeinate -u -t 3 >/dev/null 2>&1 &
+    sleep 2
+    if [ "$(arrange_asleep)" = "yes" ]; then
+      printf "%s✗%s 屏幕仍未唤醒，点亮屏幕后重试\n" "$RED" "$RST"
+      return 1
+    fi
+  fi
+
+  local plan; plan=$(arrange_plan)
+  if [ -z "$plan" ]; then
+    printf "%s✓%s 排列与快照一致，无需调整\n" "$GRN" "$RST"
+    return 0
+  fi
+  printf "正在还原显示器排列…\n"
+  arrange_restore
+  printf "%s✓%s 已还原 %s 台\n" "$GRN" "$RST" "$ARRANGE_RESTORED"
+}
+
+arrange_auto() {
+  mkdir -p "$UC_CFG_DIR" 2>/dev/null
+  case "$1" in
+    on)
+      rm -f "$UC_NOAUTO"
+      printf "%s✓%s 已开启自动还原\n" "$GRN" "$RST" ;;
+    off)
+      : > "$UC_NOAUTO"
+      printf "%s✓%s 已关闭自动还原（uc arrange apply 仍可手动还原）\n" "$GRN" "$RST" ;;
+    *)
+      if [ -f "$UC_NOAUTO" ]; then printf "自动还原：已关闭\n"; else printf "自动还原：开启\n"; fi
+      printf "用法：uc arrange auto on|off\n" ;;
+  esac
+}
+
+cmd_arrange() {
+  case "${1:-show}" in
+    show|"")  arrange_show ;;
+    save)     arrange_save ;;
+    apply)    arrange_apply ;;
+    auto)     arrange_auto "$2" ;;
+    *)
+      printf "未知子命令：%s\n" "$1" >&2
+      printf "用法：uc arrange [show|save|apply|auto on|off]\n" >&2
+      return 1 ;;
+  esac
 }
 
 # ─────────────────────────── 修复 ───────────────────────────
@@ -399,12 +610,22 @@ cmd_watch() {
 
   local last_vpn="" last_aw=""
   local last; last=$(date +%s)
+  local last_sig="" last_asleep=""
+  local last_drift="" drift_since=0 last_cool=0
 
   # 让 launchd 停止服务时能立刻退出，而不是等 sleep 跑完
   trap 'exit 0' TERM INT
 
   printf "%s通用控制守候已启动%s（每 %s 秒检查，⌃C 退出）\n" "$BOLD" "$RST" "$interval"
   printf "%s会在休眠唤醒后、以及环境异常时自动处理%s\n\n" "$DIM" "$RST"
+
+  if [ -f "$UC_ARRANGE" ]; then
+    if [ -f "$UC_NOAUTO" ]; then
+      printf "%s显示器排列快照已加载，但自动还原已关闭%s\n\n" "$DIM" "$RST"
+    else
+      printf "%s显示器排列快照已加载，重连后会检查并贴回%s\n\n" "$DIM" "$RST"
+    fi
+  fi
 
   while true; do
     local now; now=$(date +%s)
@@ -419,6 +640,58 @@ cmd_watch() {
       else printf " %s✗%s 失败\n" "$RED" "$RST"; fi
     fi
     last=$now
+
+    # 显示器排列：休眠时不碰；屏幕唤醒、显示组合变化、或偏移稳定超过 60 秒时贴回
+    if [ -f "$UC_ARRANGE" ] && [ ! -f "$UC_NOAUTO" ]; then
+      local asleep; asleep=$(arrange_asleep)
+      local sig; sig=$(arrange_tsv 2>/dev/null | cut -f1 | paste -sd ',' -)
+      local why=""
+
+      if [ "$last_asleep" = "yes" ] && [ "$asleep" = "no" ]; then
+        why="屏幕唤醒"
+      fi
+      if [ -n "$last_sig" ] && [ -n "$sig" ] && [ "$sig" != "$last_sig" ]; then
+        why="显示配置变动（$last_sig → $sig）"
+      fi
+
+      # 偏移稳定 60 秒才动手：手动拖动的过程中坐标一直在变，不会误触
+      if [ "$asleep" = "no" ]; then
+        local dr; dr=$(arrange_plan 2>/dev/null | cut -f1,4 | paste -sd ';' -)
+        if [ -n "$dr" ]; then
+          if [ "$dr" != "$last_drift" ]; then last_drift="$dr"; drift_since=$now; fi
+          if [ $((now - drift_since)) -ge 60 ] && [ -z "$why" ]; then
+            why="排列偏离快照超过 60 秒"
+          fi
+        else
+          last_drift=""; drift_since=$now
+        fi
+      fi
+
+      if [ "$asleep" = "no" ] && [ -n "$why" ]; then
+        # 「偏移」这一路加冷却，避免还原后又立刻被还原导致来回跳
+        local go=1
+        if [ "$why" = "排列偏离快照超过 60 秒" ] && [ $((now - last_cool)) -lt 600 ]; then
+          go=0
+        fi
+        if [ "$go" = "1" ]; then
+          local cur_arr; cur_arr=$(arrange_plan)
+          if [ -n "$cur_arr" ]; then
+            printf "[%s] %s%s%s，显示器排列被打乱，正在贴回快照…\n" "$ts" "$CYA" "$why" "$RST"
+            arrange_restore
+            if [ "${ARRANGE_RESTORED:-0}" -gt 0 ]; then
+              printf "[%s] %s✓%s 已还原 %s 台显示器位置\n" "$ts" "$GRN" "$RST" "$ARRANGE_RESTORED"
+              last_cool=$now
+            else
+              printf "[%s] %s✗%s 还原失败，可手动执行 %suc arrange apply%s\n" "$ts" "$RED" "$RST" "$CYA" "$RST"
+            fi
+            last_drift=""; drift_since=$now
+          fi
+        fi
+      fi
+
+      if [ -n "$sig" ]; then last_sig="$sig"; fi
+      last_asleep="$asleep"
+    fi
 
     # awdl0 状态变化
     local aw; aw=$(awdl_state)
@@ -464,10 +737,18 @@ usage() {
   ${BOLD}uc${RST} — 通用控制体检与自愈  v$VERSION
 
   ${BOLD}用法${RST}
-    uc            体检报告
-    uc fix        重置通用控制（结束进程，系统会自动拉起）
-    uc watch [秒] 守候模式，进程消失时自动恢复（默认 15 秒）
-    uc log [分]   查看最近日志（默认 60 分钟）
+    uc                      体检报告
+    uc fix                  重置通用控制（结束进程，系统会自动拉起）
+    uc watch [秒]           守候模式，掉线或排列被打乱时自动恢复（默认 15 秒）
+    uc arrange save         把当前显示器排列存成快照
+    uc arrange apply        把排列贴回快照
+    uc arrange              查看排列与快照的差异
+    uc arrange auto off     关闭守候时的自动还原
+    uc log [分]             查看最近日志（默认 60 分钟）
+
+  ${BOLD}关于排列${RST}
+    重连、唤醒、插拔显示器之后，macOS 常把副屏「重新居中」甚至丢到主屏外面。
+    快照存在 ~/.config/uc/arrange.tsv，还原时会永久写回显示配置。
 
   ${BOLD}说明${RST}
     只使用系统真实机制，不模拟点击任何界面，不受 macOS 版本更新影响。
@@ -480,6 +761,7 @@ case "${1:-check}" in
   check|"")  cmd_check ;;
   fix|reset) cmd_fix ;;
   watch)     cmd_watch "$2" ;;
+  arrange)   shift; cmd_arrange "$@" ;;
   log)       cmd_log "$2" ;;
   -h|--help|help) usage ;;
   -v|--version) echo "uc $VERSION" ;;

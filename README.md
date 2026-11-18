@@ -19,6 +19,7 @@ $ uc
       鼠标   SPK7858
       手柄   Xbox Wireless Controller
       → 不用时断开耳机和手柄，能立刻改善
+  ✓ 显示器排列与快照一致
 
 ────────────────────────────────────────────────
 结论：1 个风险项。处理后可执行 uc fix 重置通用控制。
@@ -26,7 +27,9 @@ $ uc
 
 ## 安装
 
-**环境要求**：macOS（通用控制本身需 macOS 12 及以上）。纯 shell 实现，**不依赖 Xcode、Homebrew 或任何第三方工具**，也不需要装命令行开发者工具。
+**环境要求**：macOS（通用控制本身需 macOS 12 及以上）。`uc` 本体是纯 shell 实现，**不依赖 Xcode、Homebrew 或任何第三方工具**，也不需要装命令行开发者工具。
+
+`uc arrange`（显示器排列）需要一个小程序 `ucdisplay`。安装脚本会优先用仓库里已编译好的二进制；找不到时才会调用 `swiftc` 现场编译。两者都不可用时，`uc arrange` 会提示功能不可用，其余命令照常工作。
 
 ```sh
 git clone https://github.com/MaoYo42/universal-control-fix.git
@@ -64,8 +67,37 @@ launchctl bootout gui/$(id -u)/local.uc.watch   # 本次登录内停止
 |---|---|
 | `uc` | 体检报告，列出所有影响通用控制的环节 |
 | `uc fix` | 重置通用控制，约 1 秒 |
-| `uc watch [秒]` | 守候模式，**休眠唤醒后自动重置**，并监控 awdl0 / VPN 变化 |
+| `uc watch [秒]` | 守候模式，**休眠唤醒后自动重置**，并监控 awdl0 / VPN 变化、显示器排列漂移 |
+| `uc arrange save` | 把当前显示器排列存成快照 |
+| `uc arrange apply` | 把排列贴回快照（永久写入，重连后仍保留） |
+| `uc arrange` | 查看排列与快照的差异 |
+| `uc arrange auto off` | 关闭守候时的自动还原 |
 | `uc log [分]` | 查看最近通用控制日志 |
+
+## 重连后显示器位置被打乱
+
+这是另一个独立问题，和「连不上」不是一回事：**副屏（尤其是竖屏）的位置会被系统悄悄改掉**，重连、唤醒、插拔显示器之后都可能发生。
+
+它的成因是 macOS 在显示配置变化时会「重新居中」副屏。竖屏高度 1920 比主屏 1152 高，居中后 y 偏移就变了；偶尔甚至会被丢到主屏外面去。你可以在 `~/Library/Preferences/ByHost/com.apple.windowserver.displays.*.plist` 里看到同一台显示器历次的位置记录，Y 值在 -264 / -272 / -304 / -373 之间来回跳。
+
+`uc arrange` 的做法是存快照、发现漂移就贴回去：
+
+```sh
+# 1. 把显示器摆成你想要的样式，然后存下来
+uc arrange save
+
+# 2. 以后被打乱了，一条命令贴回
+uc arrange apply
+```
+
+存下来的快照在 `~/.config/uc/arrange.tsv`，就是几行 `UUID  x  y  旋转`。还原用的是 CoreGraphics 的 `CGConfigureDisplayOrigin` + `CGConfigureDisplayConfiguration(..., .permanently)`，会**永久写进显示配置**，不是临时改内存。
+
+装上守候服务后（`./install.sh --agent`）连手动都不用：屏幕唤醒、显示配置变动、或者偏移稳定超过 60 秒，它都会自动贴回。
+
+两个已知限制，用的时候会看到明确提示，不会静默失败：
+
+- **显示器休眠时改不了**。WindowServer 会拒绝一切配置变更（错误码 1014）。`uc arrange apply` 会先自动唤醒屏幕；守候模式则跳过，等唤醒后再处理。
+- **水平方向由系统接管**。副屏必须紧贴主屏边缘，X 坐标会被自动夹到 `-1080`；真正能自由调整的是 Y 偏移。
 
 ## 它在查什么
 
