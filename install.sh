@@ -35,44 +35,10 @@ uninstall() {
   exit 0
 }
 
+# 守候服务只有一份实现，在 uc 里（uc agent on|off）。
+# 这里不重复写 plist，免得两边字段漂移。
 install_agent() {
-  mkdir -p "$(dirname "$PLIST")"
-  cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>$LABEL</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$DEST</string>
-        <string>watch</string>
-        <string>20</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$LOG_FILE</string>
-    <key>StandardErrorPath</key>
-    <string>$LOG_FILE</string>
-</dict>
-</plist>
-EOF
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
-    echo "守候服务已启动（日志：$LOG_FILE）"
-  else
-    echo "守候服务已写入 $PLIST"
-    echo
-    echo "当前环境无法立即注册（launchctl 被限制），但它在下次登录时会自动加载。"
-    echo "想马上生效，在「终端」里执行这一行："
-    echo
-    echo "  launchctl bootstrap gui/\$(id -u) \"$PLIST\""
-    echo
-  fi
+  "$DEST" agent on
 }
 
 case "${1:-}" in

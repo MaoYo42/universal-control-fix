@@ -342,8 +342,13 @@ cmd_check() {
       printf "  %s·%s 显示器排列尚未保存快照\n" "$DIM" "$RST"
       printf "      %s→ 摆好位置后执行 %suc arrange save%s%s，以后重连可一键贴回%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
     else
-      local apl; apl=$(arrange_plan)
-      if [ -z "$apl" ]; then
+      local apl arc
+      apl=$(arrange_plan); arc=$?
+      if [ "$arc" = "2" ]; then
+        printf "  %s⚠%s 显示器排列读不到（ucdisplay 失效）\n" "$YEL" "$RST"
+        printf "      %s→ 重新运行一次 install.sh 重装 ucdisplay%s\n" "$DIM" "$RST"
+        risks=$((risks+1))
+      elif [ -z "$apl" ]; then
         printf "  %s✓%s 显示器排列与快照一致\n" "$GRN" "$RST"
       else
         printf "  %s⚠%s 显示器排列与快照不一致\n" "$YEL" "$RST"
@@ -473,10 +478,22 @@ arrange_asleep() {
 }
 
 # 输出：uuid \t 快照x \t 快照y \t 当前x,当前y  （只列有差异的）
+#
+# 返回码有含义，调用方必须区分：
+#   0  正常，输出可能为空（= 一致）
+#   1  没有快照
+#   2  读不到显示器数据（ucdisplay 挂了 / 没有权限）
+#
+# 早期版本把 2 和「一致」混在一起，结果 ucdisplay 完全失效时
+# uc arrange apply 照样报「✓ 排列一致」并返回 0 —— 静默失败。
 arrange_plan() {
   [ -f "$UC_ARRANGE" ] || return 1
   local cur; cur=$(mktemp /tmp/uc-arrange.XXXXXX) || return 1
   arrange_tsv > "$cur" 2>/dev/null
+  if [ ! -s "$cur" ]; then
+    rm -f "$cur"
+    return 2
+  fi
   awk -F'\t' '
     NR == FNR { sx[$1] = $2; sy[$1] = $3; next }
     ($1 in sx) && ($2 != sx[$1] || $3 != sy[$1]) {
@@ -489,7 +506,9 @@ arrange_plan() {
 # 按快照还原，还原台数写入 ARRANGE_RESTORED
 arrange_restore() {
   ARRANGE_RESTORED=0
-  local plan; plan=$(arrange_plan)
+  local plan rc
+  plan=$(arrange_plan); rc=$?
+  [ "$rc" = "2" ] && return 1
   [ -z "$plan" ] && return 0
   local u; u=$(ucd_bin)
   [ -z "$u" ] && return 1
@@ -528,7 +547,14 @@ arrange_show() {
   fi
 
   echo
-  local plan; plan=$(arrange_plan)
+  local plan rc
+  plan=$(arrange_plan); rc=$?
+  if [ "$rc" = "2" ]; then
+    printf "%s✗%s 读不到显示器数据，无法比对\n" "$RED" "$RST"
+    printf "  %sucdisplay 可能失效：%s list --tsv%s\n" "$DIM" "$(ucd_bin)" "$RST"
+    echo
+    return 1
+  fi
   if [ -z "$plan" ]; then
     printf "%s✓%s 与快照一致（快照时间 %s）\n" "$GRN" "$RST" "$(date -r "$UC_ARRANGE" '+%m-%d %H:%M')"
   else
@@ -603,7 +629,13 @@ arrange_apply() {
   fi
 
   # ② 显示器排列
-  local plan; plan=$(arrange_plan)
+  local plan rc
+  plan=$(arrange_plan); rc=$?
+  if [ "$rc" = "2" ]; then
+    printf "%s✗%s 读不到显示器数据，无法比对\n" "$RED" "$RST"
+    printf "  %sucdisplay 可能失效：%s list --tsv%s\n" "$DIM" "$u" "$RST"
+    return 1
+  fi
   if [ -z "$plan" ]; then
     printf "%s✓%s 显示器排列与快照一致，无需调整\n" "$GRN" "$RST"
     return 0
@@ -887,6 +919,7 @@ cmd_watch() {
   local last; last=$(date +%s)
   local last_sig="" last_asleep=""
   local last_drift="" drift_since=0 last_cool=0
+  local ucd_bad=0   # ucdisplay 读不到数据时置 1，只在状态翻转时记一次日志
 
   # 让 launchd 停止服务时能立刻退出，而不是等 sleep 跑完
   trap 'exit 0' TERM INT
@@ -931,7 +964,23 @@ cmd_watch() {
 
       # 偏移稳定 60 秒才动手：手动拖动的过程中坐标一直在变，不会误触
       if [ "$asleep" = "no" ]; then
-        local dr; dr=$(arrange_plan 2>/dev/null | cut -f1,4 | paste -sd ';' -)
+        local dr drc
+        dr=$(arrange_plan 2>/dev/null); drc=$?
+        if [ "$drc" = "2" ]; then
+          # 读不到显示器数据。不能当成「没有偏移」，否则 ucdisplay 挂了
+          # 之后自动还原会静默失效，而日志里一片正常。
+          dr=""
+          if [ "$ucd_bad" = "0" ]; then
+            printf "[%s] %s⚠%s 读不到显示器数据，自动还原暂停（ucdisplay 失效？）\n" "$ts" "$YEL" "$RST"
+            ucd_bad=1
+          fi
+        else
+          if [ "$ucd_bad" = "1" ]; then
+            printf "[%s] %s✓%s 显示器数据恢复\n" "$ts" "$GRN" "$RST"
+            ucd_bad=0
+          fi
+          dr=$(printf '%s\n' "$dr" | cut -f1,4 | paste -sd ';' -)
+        fi
         if [ -n "$dr" ]; then
           if [ "$dr" != "$last_drift" ]; then last_drift="$dr"; drift_since=$now; fi
           if [ $((now - drift_since)) -ge 60 ] && [ -z "$why" ]; then

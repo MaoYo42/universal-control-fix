@@ -190,6 +190,14 @@ echo "已生成：$APP"
 
 if [ "${1:-}" = "--install" ]; then
   mkdir -p "$HOME/Applications" "$(dirname "$PLIST")"
+
+  # 必须先停掉旧实例再动 bundle。
+  # 反过来做的话，正在运行的进程会在签名被替换的瞬间收到
+  # SIGKILL (Code Signature Invalid / Launch Constraint Violation)，
+  # 看起来像崩溃，实际是升级流程自己把进程杀了。
+  pkill -f "UCMenu.app/Contents/MacOS/UCMenu" 2>/dev/null || true
+  sleep 0.5
+
   rm -rf "$DEST"
   cp -R "$APP" "$DEST"
 
@@ -207,8 +215,6 @@ if [ "${1:-}" = "--install" ]; then
 </plist>
 EOF
 
-  pkill -f "UCMenu.app/Contents/MacOS/UCMenu" 2>/dev/null || true
-  sleep 0.3
   if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
     echo "已启动，登录时自动运行"
   else

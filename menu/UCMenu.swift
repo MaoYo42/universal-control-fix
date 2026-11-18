@@ -78,7 +78,16 @@ func run(_ path: String, _ args: [String], timeout: TimeInterval = 5) -> (Int32,
 
     let deadline = Date().addingTimeInterval(timeout)
     while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
-    if p.isRunning { p.terminate() }
+
+    // 超时后先 SIGTERM，给 1 秒收尾；还不退就 SIGKILL。
+    // 只发 SIGTERM 就 waitUntilExit 是有风险的：进程忽略信号时会永久挂住，
+    // 而调用方（fastBusy/slowBusy 的守卫）会被永久卡在 busy 状态。
+    if p.isRunning {
+        p.terminate()
+        let grace = Date().addingTimeInterval(1.0)
+        while p.isRunning && Date() < grace { Thread.sleep(forTimeInterval: 0.02) }
+        if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+    }
 
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let out = String(data: data, encoding: .utf8) ?? ""
@@ -171,8 +180,11 @@ final class Controller: NSObject, NSMenuDelegate {
     var menuOpen = false
     var fastBusy = false
     var slowBusy = false
+    var shareBusy = false
     var fastTimer: Timer?
     var slowTimer: Timer?
+    /// 上一次渲染对应的状态指纹，用来避免每 4 秒无意义地重建整个菜单
+    var lastSig = ""
 
     override init() {
         super.init()
@@ -201,13 +213,20 @@ final class Controller: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
         rebuild()
+        refreshShareState()
     }
 
     func menuDidClose(_ menu: NSMenu) {
         menuOpen = false
+        // 展开期间后台刷新不重建菜单，这里补一次（没变化会自己跳过）
+        rebuild()
     }
 
     /// 便宜：进程、账本时间、排列差异
+    ///
+    /// 注意：NSScreen 不是线程安全的，必须在主线程取。所以
+    /// diffArrangement()（内部用 NSScreen.screens 拿显示器名字）
+    /// 放在回到主线程之后算，后台只做真正会阻塞的进程调用和文件 stat。
     func refreshFast() {
         if fastBusy { return }
         fastBusy = true
@@ -227,13 +246,12 @@ final class Controller: NSObject, NSMenuDelegate {
                 }
             }
 
-            let diff = diffArrangement()
             let restoreUC = FileManager.default.fileExists(atPath: restoreUCFlag)
 
             DispatchQueue.main.async {
                 self.state.pid = pid
                 self.state.ledger = ledger
-                self.state.arrange = diff
+                self.state.arrange = diffArrangement()   // 主线程，NSScreen 安全
                 self.state.restoreUC = restoreUC
                 self.fastBusy = false
                 if !self.menuOpen { self.rebuild() }
@@ -241,7 +259,7 @@ final class Controller: NSObject, NSMenuDelegate {
         }
     }
 
-    /// 慢：system_profiler / shortcuts
+    /// 慢：system_profiler / shortcuts 列表
     func refreshSlow() {
         if slowBusy { return }
         slowBusy = true
@@ -256,25 +274,41 @@ final class Controller: NSObject, NSMenuDelegate {
             }
 
             var names = Set<String>()
-            var shareOn: Int?
             if !cfgSnapshot.shortcutOn.isEmpty || !cfgSnapshot.shortcutOff.isEmpty || !cfgSnapshot.shortcutState.isEmpty {
                 let (_, lst) = run("/usr/bin/shortcuts", ["list"], timeout: 10)
                 for line in lst.split(separator: "\n") {
                     names.insert(line.trimmingCharacters(in: .whitespaces))
                 }
             }
-            if !cfgSnapshot.shortcutState.isEmpty {
-                let (_, out) = run("/usr/bin/shortcuts", ["run", cfgSnapshot.shortcutState], timeout: 15)
-                let v = out.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                if ["1", "true", "on", "yes", "开"].contains(v) { shareOn = 1 }
-                else if ["0", "false", "off", "no", "关"].contains(v) { shareOn = 0 }
-            }
 
             DispatchQueue.main.async {
                 self.state.ipad = ipad
                 self.state.shortcuts = names
-                self.state.shareOn = shareOn
                 self.slowBusy = false
+                if !self.menuOpen { self.rebuild() }
+            }
+        }
+    }
+
+    /// 共享键鼠的当前状态
+    ///
+    /// 只能靠「跑一个快捷指令、读它的输出」来查，而 `shortcuts run` 是有副作用的
+    /// ——可能弹横幅、可能抢焦点。所以不放定时器里，改成打开菜单时才查一次。
+    /// 菜单先用缓存值渲染，查到后如果变了再刷一次。
+    func refreshShareState() {
+        let name = cfg.shortcutState
+        guard !name.isEmpty, state.shortcuts.contains(name) else { return }
+        if shareBusy { return }
+        shareBusy = true
+        DispatchQueue.global(qos: .utility).async {
+            let (_, out) = run("/usr/bin/shortcuts", ["run", name], timeout: 15)
+            let v = out.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            var on: Int?
+            if ["1", "true", "on", "yes", "开"].contains(v) { on = 1 }
+            else if ["0", "false", "off", "no", "关"].contains(v) { on = 0 }
+            DispatchQueue.main.async {
+                self.state.shareOn = on
+                self.shareBusy = false
                 if !self.menuOpen { self.rebuild() }
             }
         }
@@ -282,8 +316,26 @@ final class Controller: NSObject, NSMenuDelegate {
 
     // ─────────────────────── 菜单 ───────────────────────
 
-    func rebuild() {
+    /// 把影响菜单外观的所有状态压成一个字符串。
+    /// 每 4 秒无条件 removeAllItems 重建十几个菜单项，虽然不泄漏，
+    /// 但会白白制造对象和两次 stat 系统调用，而且会让菜单有细微抖动。
+    func stateSignature() -> String {
+        var s = "\(state.pid)|\(state.ipad)|\(state.shareOn.map(String.init) ?? "-")"
+        s += "|\(state.restoreUC ? 1 : 0)|\(state.shortcuts.count)"
+        s += "|\(state.ledger?.timeIntervalSince1970 ?? 0)"
+        s += "|\(state.arrange.hasSnapshot ? 1 : 0)"
+        s += "|" + state.arrange.moved.joined(separator: ";")
+        s += "|\(cfg.shortcutOn)|\(cfg.shortcutOff)|\(cfg.shortcutState)"
+        s += "|\(FileManager.default.isExecutableFile(atPath: ucBin) ? 1 : 0)"
+        return s
+    }
+
+    func rebuild(force: Bool = false) {
         guard let menu = statusItem.menu else { return }
+        let sig = stateSignature()
+        if !force && sig == lastSig { return }
+        lastSig = sig
+
         menu.removeAllItems()
         statusItem.button?.appearsDisabled = state.pid.isEmpty
         let running = !state.pid.isEmpty
@@ -321,7 +373,9 @@ final class Controller: NSObject, NSMenuDelegate {
         save.isEnabled = FileManager.default.isExecutableFile(atPath: ucBin)
         menu.addItem(save)
 
-        let ucToggle = NSMenuItem(title: "  还原时一并恢复 iPad 位置（实验）",
+        // 这个开关同时影响「保存」和「还原」——没有 iPad 位置快照就无从还原，
+        // 所以标题必须写清楚，不能只说「还原时」
+        let ucToggle = NSMenuItem(title: "  iPad 位置：保存与还原一并处理（实验）",
                                   action: #selector(toggleRestoreUC), keyEquivalent: "")
         ucToggle.target = self
         ucToggle.state = state.restoreUC ? .on : .off
@@ -415,8 +469,11 @@ final class Controller: NSObject, NSMenuDelegate {
     }
 
     @objc func doRestart() {
-        if !state.pid.isEmpty { run("/bin/kill", ["-9", state.pid], timeout: 3) }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.2) {
+        // 整条链路都放后台：run() 会阻塞调用线程，放在主线程会让菜单卡住
+        let pid = state.pid
+        DispatchQueue.global(qos: .userInitiated).async {
+            if !pid.isEmpty { run("/bin/kill", ["-9", pid], timeout: 3) }
+            Thread.sleep(forTimeInterval: 1.2)
             let (_, pg) = run("/usr/bin/pgrep", ["-f", kUCPattern], timeout: 3)
             if pg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 run("/usr/bin/open", ["-a", kUCApp], timeout: 5)
@@ -429,13 +486,18 @@ final class Controller: NSObject, NSMenuDelegate {
         guard !name.isEmpty else { return }
         DispatchQueue.global().async {
             run("/usr/bin/shortcuts", ["run", name], timeout: 30)
-            DispatchQueue.main.async { self.refreshSlow() }
+            DispatchQueue.main.async { self.refreshShareState() }
         }
     }
 
     @objc func doShareOn() { runShortcut(cfg.shortcutOn) }
     @objc func doShareOff() { runShortcut(cfg.shortcutOff) }
-    @objc func doRefresh() { cfg = loadCfg(); refreshFast(); refreshSlow() }
+    @objc func doRefresh() {
+        cfg = loadCfg()
+        refreshFast()
+        refreshSlow()
+        refreshShareState()
+    }
     @objc func doQuit() { NSApp.terminate(nil) }
 
     @objc func doOpenSettings() {
