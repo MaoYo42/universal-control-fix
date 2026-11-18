@@ -1,3 +1,8 @@
 .DS_Store
 *.zip
 *.tar.gz
+
+# 构建产物
+menu/build/
+dist/stage/
+dist/*.dmg

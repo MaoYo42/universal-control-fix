@@ -88,13 +88,19 @@ if [ -x "$SRC_DIR/tools/ucdisplay" ]; then
   install -m 755 "$SRC_DIR/tools/ucdisplay" "$DEST_DISPLAY"
   echo "已安装：$DEST_DISPLAY"
 elif command -v swiftc >/dev/null 2>&1 && [ -f "$SRC_DIR/tools/ucdisplay.swift" ]; then
-  if swiftc -O -o "$DEST_DISPLAY" "$SRC_DIR/tools/ucdisplay.swift" \
-       -framework CoreGraphics -framework AppKit 2>/dev/null; then
+  # 通用二进制：x86_64 切片的目标要定在 14.0，CLT 的 Swift 兼容库只带 arm64
+  _t=$(mktemp -d)
+  if swiftc -O -target arm64-apple-macos12.0 -o "$_t/a" "$SRC_DIR/tools/ucdisplay.swift" \
+       -framework CoreGraphics -framework AppKit 2>/dev/null \
+     && swiftc -O -target x86_64-apple-macos14.0 -o "$_t/b" "$SRC_DIR/tools/ucdisplay.swift" \
+       -framework CoreGraphics -framework AppKit 2>/dev/null \
+     && lipo -create "$_t/a" "$_t/b" -output "$DEST_DISPLAY" 2>/dev/null; then
     chmod 755 "$DEST_DISPLAY"
-    echo "已编译并安装：$DEST_DISPLAY"
+    echo "已编译并安装：$DEST_DISPLAY（$(lipo -archs "$DEST_DISPLAY")）"
   else
     echo "提示：ucdisplay 编译失败，uc arrange 相关功能不可用"
   fi
+  rm -rf "$_t"
 else
   echo "提示：未找到 ucdisplay，uc arrange 相关功能不可用"
 fi

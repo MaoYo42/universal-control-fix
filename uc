@@ -5,13 +5,13 @@
 #   uc               体检报告
 #   uc fix           重置通用控制
 #   uc watch         后台守候，掉线自动恢复
-#   uc arrange       显示器排列快照（save / apply / auto）
+#   uc arrange       显示器排列快照（save / apply / auto / uc）
 #   uc log           查看最近日志
 #
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
 
@@ -19,6 +19,8 @@ UC_APP="/System/Library/CoreServices/UniversalControl.app"
 UC_CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uc"
 UC_ARRANGE="$UC_CFG_DIR/arrange.tsv"
 UC_NOAUTO="$UC_CFG_DIR/arrange.noauto"
+UC_UCBLOB="$UC_CFG_DIR/uc-config.plist"
+UC_RESTOREUC="$UC_CFG_DIR/restore-uc"   # 存在 = 还原排列时一并还原 iPad 位置
 
 # launchd 启动时环境变量极简，显式补齐，保证 system_profiler 等能找到
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:$PATH"
@@ -389,6 +391,79 @@ arrange_tsv() {
   "$u" list --tsv 2>/dev/null
 }
 
+# ── 通用控制配置账本 ──
+#
+# 通用控制下的 iPad 不是显示器：CGGetOnlineDisplayList 里永远看不到它，
+# 没有 framebuffer、没有 UUID、没有坐标，所以挪不动它。
+# 它挂在显示器哪条边，记录在
+#   ~/Library/Preferences/ByHost/com.apple.universalcontrol.<硬件UUID>.plist
+# 的 Configuration 二进制 blob 里（设备↔显示器 边表）。
+# 单个字段无法直接改写，只能整份备份、整份写回，再让进程重读。
+#
+# 走 defaults export/import 而不是 cp：写入由 cfprefsd 自己完成，
+# 不会被它的内存缓存覆盖回去，也就不需要 killall cfprefsd。
+
+ucblob_domain="com.apple.universalcontrol"
+
+# 定位真实的 ByHost plist 文件
+ucblob_path() {
+  local f
+  for f in "$HOME/Library/Preferences/ByHost/$ucblob_domain."*.plist; do
+    if [ -f "$f" ]; then printf '%s' "$f"; return 0; fi
+  done
+  return 1
+}
+
+# 导出当前配置到 $UC_UCBLOB
+ucblob_save() {
+  mkdir -p "$UC_CFG_DIR" 2>/dev/null
+  if ! /usr/bin/defaults -currentHost export "$ucblob_domain" "$UC_UCBLOB" 2>/dev/null; then
+    printf "  %s✗%s 读取通用控制配置失败\n" "$RED" "$RST"
+    return 1
+  fi
+  local sz; sz=$(wc -c < "$UC_UCBLOB" | tr -d ' ')
+  printf "  %s✓%s 已保存通用控制配置（%s 字节，含 iPad 边表）\n" "$GRN" "$RST" "$sz"
+}
+
+# 把 $UC_UCBLOB 写回系统，并重启通用控制让它重读
+ucblob_restore() {
+  if [ ! -f "$UC_UCBLOB" ]; then
+    printf "  %s·%s 没有通用控制配置快照，跳过 iPad 位置还原\n" "$DIM" "$RST"
+    return 0
+  fi
+  local dst; dst=$(ucblob_path)
+  if [ -z "$dst" ]; then
+    printf "  %s✗%s 找不到通用控制配置文件\n" "$RED" "$RST"
+    return 1
+  fi
+
+  # 先留回退，写坏了还能捞回来
+  cp "$dst" "$UC_UCBLOB.bak" 2>/dev/null
+
+  local cur; cur=$(mktemp /tmp/uc-blob.XXXXXX) || return 1
+  /usr/bin/defaults -currentHost export "$ucblob_domain" "$cur" 2>/dev/null
+  if cmp -s "$UC_UCBLOB" "$cur"; then
+    rm -f "$cur"
+    printf "  %s·%s 配置与快照一致，无需写回\n" "$DIM" "$RST"
+    return 0
+  fi
+  rm -f "$cur"
+
+  if ! /usr/bin/defaults -currentHost import "$ucblob_domain" "$UC_UCBLOB" 2>/dev/null; then
+    printf "  %s✗%s 写回通用控制配置失败\n" "$RED" "$RST"
+    return 1
+  fi
+  printf "  %s✓%s 已写回配置，重启通用控制让它重读…\n" "$GRN" "$RST"
+
+  local newpid; newpid=$(reset_uc)
+  if [ -n "$newpid" ]; then
+    printf "  %s✓%s 通用控制已重启（pid %s）\n" "$GRN" "$RST" "$newpid"
+  else
+    printf "  %s⚠%s 通用控制没起来，稍等它会被系统拉起\n" "$YEL" "$RST"
+  fi
+  sleep 1
+}
+
 # 任一显示器休眠时输出 yes。休眠状态下 WindowServer 拒绝一切排列变更。
 arrange_asleep() {
   local u; u=$(ucd_bin)
@@ -470,10 +545,18 @@ arrange_show() {
   else
     printf "  %s自动还原：开启（守候模式检测到重连后会自动贴回）%s\n" "$DIM" "$RST"
   fi
+
+  # iPad 逻辑位置账本
+  if [ -f "$UC_UCBLOB" ]; then
+    printf "  %s iPad 位置快照：已保存（%s）%s\n" "$DIM" "$(date -r "$UC_UCBLOB" '+%m-%d %H:%M')" "$RST"
+  else
+    printf "  %s iPad 位置快照：未保存 → %suc arrange save --with-uc%s\n" "$DIM" "$CYA" "$RST"
+  fi
   echo
 }
 
 arrange_save() {
+  local withuc="$1"
   local u; u=$(ucd_bin)
   if [ -z "$u" ]; then
     printf "%s✗%s 找不到 ucdisplay 组件，请重新运行 install.sh\n" "$RED" "$RST"
@@ -486,10 +569,20 @@ arrange_save() {
   fi
   local n; n=$(wc -l < "$UC_ARRANGE" | tr -d ' ')
   printf "%s✓%s 已保存 %s 台显示器的排列 → %s\n" "$GRN" "$RST" "$n" "$UC_ARRANGE"
+
+  # iPad 位置一并存进通用控制配置账本
+  if [ "$withuc" = "yes" ]; then
+    ucblob_save
+  fi
+
   printf "  %s以后排列被打乱时，执行 %suc arrange apply%s%s 即可贴回%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+  if [ "$withuc" != "yes" ]; then
+    printf "  %s想连 iPad 的逻辑位置一起存，加 %s--with-uc%s\n" "$DIM" "$CYA" "$RST"
+  fi
 }
 
 arrange_apply() {
+  local withuc="$1"
   local u; u=$(ucd_bin)
   if [ -z "$u" ]; then
     printf "%s✗%s 找不到 ucdisplay 组件，请重新运行 install.sh\n" "$RED" "$RST"
@@ -498,6 +591,22 @@ arrange_apply() {
   if [ ! -f "$UC_ARRANGE" ]; then
     printf "%s✗%s 还没有快照，先摆好位置再执行 %suc arrange save%s\n" "$RED" "$RST" "$CYA" "$RST"
     return 1
+  fi
+
+  # 没显式传参时，看菜单栏程序留下的开关
+  if [ -z "$withuc" ] && [ -f "$UC_RESTOREUC" ]; then withuc="yes"; fi
+
+  # ① iPad 逻辑位置：先做，因为写回配置会重启通用控制
+  if [ "$withuc" = "yes" ]; then
+    printf "正在还原 iPad 逻辑位置…\n"
+    ucblob_restore
+  fi
+
+  # ② 显示器排列
+  local plan; plan=$(arrange_plan)
+  if [ -z "$plan" ]; then
+    printf "%s✓%s 显示器排列与快照一致，无需调整\n" "$GRN" "$RST"
+    return 0
   fi
 
   # 休眠时系统会拒绝调整排列，先把屏幕叫醒
@@ -511,14 +620,173 @@ arrange_apply() {
     fi
   fi
 
-  local plan; plan=$(arrange_plan)
-  if [ -z "$plan" ]; then
-    printf "%s✓%s 排列与快照一致，无需调整\n" "$GRN" "$RST"
-    return 0
-  fi
   printf "正在还原显示器排列…\n"
   arrange_restore
   printf "%s✓%s 已还原 %s 台\n" "$GRN" "$RST" "$ARRANGE_RESTORED"
+}
+
+# iPad 位置账本的独立入口，方便单独验证
+arrange_uc() {
+  case "${1:-status}" in
+    save)    ucblob_save ;;
+    restore) ucblob_restore ;;
+    edges)   ucblob_edges ;;
+    diff)    ucblob_diff ;;
+    *)
+      local f; f=$(ucblob_path)
+      if [ -n "$f" ]; then
+        printf "配置文件：%s\n" "$f"
+        printf "修改时间：%s\n" "$(date -r "$f" '+%m-%d %H:%M:%S')"
+      else
+        printf "%s✗%s 找不到通用控制配置文件\n" "$RED" "$RST"
+      fi
+      if [ -f "$UC_UCBLOB" ]; then
+        printf "快照：已保存（%s 字节，%s）\n" \
+          "$(wc -c < "$UC_UCBLOB" | tr -d ' ')" "$(date -r "$UC_UCBLOB" '+%m-%d %H:%M')"
+      else
+        printf "快照：尚未保存 → %suc arrange save --with-uc%s\n" "$CYA" "$RST"
+      fi
+      printf "用法：uc arrange uc [save|restore|edges|diff]\n" ;;
+  esac
+}
+
+# 比对快照与当前配置的边表，看「对端→显示器」的最新边值有没有变
+ucblob_diff() {
+  local live; live=$(ucblob_path)
+  if [ -z "$live" ]; then
+    printf "%s✗%s 找不到通用控制配置文件\n" "$RED" "$RST"; return 1
+  fi
+  if [ ! -f "$UC_UCBLOB" ]; then
+    printf "%s✗%s 还没有快照，先执行 %suc arrange uc save%s\n" "$RED" "$RST" "$CYA" "$RST"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf "%s·%s 需要 python3 才能解码边表\n" "$DIM" "$RST"; return 1
+  fi
+  python3 - "$UC_UCBLOB" "$live" <<'PY'
+import plistlib, sys
+
+def load(path):
+    d = plistlib.load(open(path, 'rb'))
+    inner = plistlib.loads(d['Configuration'])
+    newest = {}
+    for node in inner.get('heap', []):
+        for item in node:
+            if not isinstance(item, list) or len(item) != 8:
+                continue
+            ts, kind, sess, dev, peer, disp, e1, e2 = item
+            if not isinstance(ts, int) or not isinstance(sess, str):
+                continue
+            k = (peer, disp)
+            if k not in newest or ts > newest[k][0]:
+                newest[k] = (ts, e1, e2)
+    return newest
+
+snap, live = load(sys.argv[1]), load(sys.argv[2])
+
+def fe(v):
+    if v == 32767: return '无'
+    if v == 65535: return '满'
+    return f'{v/65535*100:.0f}%'
+
+keys = sorted(set(snap) | set(live), key=lambda k: -max(
+    (snap.get(k, (0,))[0], live.get(k, (0,))[0])))
+changed = 0
+for k in keys:
+    s, l = snap.get(k), live.get(k)
+    se = f"{fe(s[1])} / {fe(s[2])}" if s else '（快照无）'
+    le = f"{fe(l[1])} / {fe(l[2])}" if l else '（现在无）'
+    if s and l and s[1:] == l[1:]:
+        continue
+    changed += 1
+    print(f"对端 {k[0][:8]}  →  显示器 {k[1][:8]}")
+    print(f"    快照 {se}")
+    print(f"    现在 {le}")
+
+if changed == 0:
+    print('边表与快照完全一致——说明这段时间里没有任何位置变化被记录。')
+else:
+    print()
+    print(f'共 {changed} 组边表有变化。')
+PY
+}
+
+# 把 Configuration 里的「设备↔显示器」边表摊开成人能看的样子。
+# 结构：heap 里若干 8 元列表
+#   [时间戳微秒, 类型(0/1/3), 会话UUID, 设备UUID, 对端UUID, 显示器UUID, 边值, 边值]
+# 边值是 16 位定点数：32767(0x7FFF) 表示「无 / 居中」，65535(0xFFFF) 表示满。
+ucblob_edges() {
+  local src="${1:-}"
+  [ -z "$src" ] && src="$UC_UCBLOB"
+  if [ ! -f "$src" ]; then
+    printf "%s✗%s 没有可解析的文件：%s\n" "$RED" "$RST" "$src"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf "%s·%s 需要 python3 才能解码边表\n" "$DIM" "$RST"
+    return 1
+  fi
+
+  python3 - "$src" <<'PY'
+import plistlib, sys, subprocess, re
+
+path = sys.argv[1]
+d = plistlib.load(open(path, 'rb'))
+blob = d.get('Configuration')
+if not blob:
+    print('没有 Configuration 键'); sys.exit(1)
+inner = plistlib.loads(blob)
+heap = inner.get('heap', [])
+print(f"结构版本 vers={inner.get('vers')}  节点 {len(heap)} 个")
+
+rows = []
+for node in heap:
+    for item in node:
+        if not isinstance(item, list) or len(item) != 8:
+            continue
+        ts, kind, sess, dev, peer, disp, e1, e2 = item
+        if not isinstance(ts, int) or not isinstance(sess, str):
+            continue
+        rows.append((ts, kind, sess, dev, peer, disp, e1, e2))
+
+if not rows:
+    print('没找到边表条目'); sys.exit(0)
+
+# 时间戳是「开机以来的单调时钟」，单位纳秒（可用最新一条和文件 mtime 交叉验证）
+try:
+    bt = subprocess.check_output(['sysctl', '-n', 'kern.boottime']).decode()
+    boot = int(re.search(r'sec = (\d+)', bt).group(1))
+except Exception:
+    boot = None
+
+def fmt_edge(v):
+    if v == 32767: return '无'
+    if v == 65535: return '满'
+    return f'{v/65535*100:.0f}%'
+
+def fmt_ts(us):
+    s = us / 1e9
+    if boot is None:
+        return f'+{s:.0f}s'
+    return f'开机后 {int(s)//60:02d}:{int(s)%60:02d}'
+
+# 按「对端+显示器」分组，每组取最新 3 条
+groups = {}
+for r in rows:
+    groups.setdefault((r[4], r[5]), []).append(r)
+
+newest = max(r[0] for r in rows)
+print()
+for (peer, disp), items in sorted(groups.items(), key=lambda kv: -max(x[0] for x in kv[1])):
+    items.sort(key=lambda x: -x[0])
+    flag = '  ← 最新' if items[0][0] == newest else ''
+    print(f"对端 {peer[:8]}  →  显示器 {disp[:8]}{flag}")
+    for ts, kind, sess, dev, _p, _d, e1, e2 in items[:3]:
+        print(f"    {fmt_ts(ts)}  type={kind}  设备{dev[:8]}  边={fmt_edge(e1)} / {fmt_edge(e2)}")
+
+print()
+print('提示：边值 0% / 100% 是贴着那条边的比例，32767(无) 表示该方向不接。')
+PY
 }
 
 arrange_auto() {
@@ -537,14 +805,21 @@ arrange_auto() {
 }
 
 cmd_arrange() {
-  case "${1:-show}" in
+  local sub="${1:-show}"
+  local withuc="" a
+  for a in "$@"; do
+    [ "$a" = "--with-uc" ] && withuc="yes"
+  done
+  case "$sub" in
     show|"")  arrange_show ;;
-    save)     arrange_save ;;
-    apply)    arrange_apply ;;
-    auto)     arrange_auto "$2" ;;
+    save)     arrange_save "$withuc" ;;
+    apply)    arrange_apply "$withuc" ;;
+    auto)     arrange_auto "${2:-}" ;;
+    uc)       arrange_uc "${2:-status}" ;;
     *)
       printf "未知子命令：%s\n" "$1" >&2
-      printf "用法：uc arrange [show|save|apply|auto on|off]\n" >&2
+      printf "用法：uc arrange [show|save|apply|auto on|off|uc save|uc restore]\n" >&2
+      printf "      %suc arrange apply --with-uc%s  连 iPad 逻辑位置一起还原\n" "$CYA" "$RST" >&2
       return 1 ;;
   esac
 }
@@ -729,6 +1004,75 @@ cmd_log() {
   echo
 }
 
+# ─────────────────────── 守候服务 ───────────────────────
+
+UC_PLIST="$HOME/Library/LaunchAgents/local.uc.watch.plist"
+UC_WATCH_LOG="$HOME/Library/Logs/uc-watch.log"
+UC_LABEL="local.uc.watch"
+
+# 找到自己的绝对路径，launchd 里不能靠 PATH
+uc_self() {
+  local p="$0"
+  case "$p" in
+    /*) printf '%s' "$p" ;;
+    *)  printf '%s/%s' "$(cd "$(dirname "$p")" && pwd)" "$(basename "$p")" ;;
+  esac
+}
+
+cmd_agent() {
+  case "${1:-status}" in
+    on|install)
+      mkdir -p "$(dirname "$UC_PLIST")" "$(dirname "$UC_WATCH_LOG")"
+      local self; self=$(uc_self)
+      cat > "$UC_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$UC_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$self</string>
+        <string>watch</string>
+        <string>20</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$UC_WATCH_LOG</string>
+    <key>StandardErrorPath</key><string>$UC_WATCH_LOG</string>
+</dict>
+</plist>
+EOF
+      launchctl bootout "gui/$(id -u)/$UC_LABEL" 2>/dev/null
+      if launchctl bootstrap "gui/$(id -u)" "$UC_PLIST" 2>/dev/null; then
+        printf "%s✓%s 守候服务已启动（日志：%s）\n" "$GRN" "$RST" "$UC_WATCH_LOG"
+      else
+        printf "%s·%s 已写入 %s，下次登录自动加载\n" "$YEL" "$RST" "$UC_PLIST"
+        printf "  %s想马上生效：launchctl bootstrap gui/\$(id -u) \"%s\"%s\n" "$DIM" "$UC_PLIST" "$RST"
+      fi
+      ;;
+    off|uninstall)
+      launchctl bootout "gui/$(id -u)/$UC_LABEL" 2>/dev/null
+      rm -f "$UC_PLIST"
+      printf "%s✓%s 守候服务已移除\n" "$GRN" "$RST"
+      ;;
+    *)
+      if [ -f "$UC_PLIST" ]; then
+        printf "守候服务：已安装（%s）\n" "$UC_PLIST"
+        if launchctl print "gui/$(id -u)/$UC_LABEL" >/dev/null 2>&1; then
+          printf "  运行状态：%s运行中%s\n" "$GRN" "$RST"
+        else
+          printf "  运行状态：%s未运行%s\n" "$YEL" "$RST"
+        fi
+        [ -f "$UC_WATCH_LOG" ] && printf "  日志：%s（%s）\n" "$UC_WATCH_LOG" "$(date -r "$UC_WATCH_LOG" '+%m-%d %H:%M')"
+      else
+        printf "守候服务：未安装\n"
+        printf "  %s→ %suc agent on%s%s 装上，开机自动守候%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+      fi
+      printf "用法：uc agent on|off\n" ;;
+  esac
+}
+
 # ─────────────────────────── 入口 ───────────────────────────
 
 usage() {
@@ -740,10 +1084,13 @@ usage() {
     uc                      体检报告
     uc fix                  重置通用控制（结束进程，系统会自动拉起）
     uc watch [秒]           守候模式，掉线或排列被打乱时自动恢复（默认 15 秒）
+    uc agent on|off         开机自动守候的 launchd 服务
     uc arrange save         把当前显示器排列存成快照
     uc arrange apply        把排列贴回快照
     uc arrange              查看排列与快照的差异
     uc arrange auto off     关闭守候时的自动还原
+    uc arrange save --with-uc   连 iPad 位置一起存（实验）
+    uc arrange uc           查看 iPad 位置账本
     uc log [分]             查看最近日志（默认 60 分钟）
 
   ${BOLD}关于排列${RST}
@@ -761,6 +1108,7 @@ case "${1:-check}" in
   check|"")  cmd_check ;;
   fix|reset) cmd_fix ;;
   watch)     cmd_watch "$2" ;;
+  agent)     cmd_agent "$2" ;;
   arrange)   shift; cmd_arrange "$@" ;;
   log)       cmd_log "$2" ;;
   -h|--help|help) usage ;;
