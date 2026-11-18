@@ -35,6 +35,8 @@ cd universal-control-fix
 ./install.sh --agent    # 额外装登录自启的守候服务
 ```
 
+不想用 git 的话，直接下 [Releases](https://github.com/MaoYo42/universal-control-fix/releases) 里的压缩包，解压后同样执行 `./install.sh`。
+
 `--agent` 会写入 `~/Library/LaunchAgents/local.uc.watch.plist`，由 launchd 在**每次登录时自动加载**，之后休眠唤醒会自动重置通用控制，进程意外退出也会被拉起。
 
 想立刻生效、不等下次登录，在终端执行：
