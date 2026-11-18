@@ -29,6 +29,8 @@ $ uc
 **环境要求**：macOS（通用控制本身需 macOS 12 及以上）。纯 shell 实现，**不依赖 Xcode、Homebrew 或任何第三方工具**，也不需要装命令行开发者工具。
 
 ```sh
+git clone https://github.com/MaoYo42/universal-control-fix.git
+cd universal-control-fix
 ./install.sh            # 装到 ~/bin/uc
 ./install.sh --agent    # 额外装登录自启的守候服务
 ```
