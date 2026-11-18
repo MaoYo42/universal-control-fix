@@ -10,7 +10,7 @@
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
 
@@ -118,7 +118,49 @@ awdl_state() {
 }
 
 vpn_active() {
-  scutil --nc list 2>/dev/null | grep -E '^\s*\* \(Connected\)' | sed -E 's/.*"(.*)".*/\1/'
+  local out=""
+  # 系统 VPN 服务（NetworkExtension 注册的那种）
+  out=$(scutil --nc list 2>/dev/null | grep -E '^[[:space:]]*\* \(Connected\)' | sed -E 's/.*"(.*)".*/\1/' | paste -sd '、' -)
+  # TUN 模式代理（Shadowrocket / Clash / Surge）：scutil 看不到，只能看路由
+  local tun
+  tun=$(netstat -rn 2>/dev/null | awk '
+    # 只认 IPv4 的 0/1、128.0/1 半区路由，或指向 fake-IP 网关的默认路由
+    ($1=="0/1" || $1=="128.0/1") && $2 ~ /^[0-9]+\./ { for(i=1;i<=NF;i++) if ($i ~ /^utun[0-9]+$/) print $i; next }
+    $1=="default" && $2 ~ /^198\.18\./ { for(i=1;i<=NF;i++) if ($i ~ /^utun[0-9]+$/) print $i }
+  ' | sort -u | paste -sd ',' -)
+  if [ -n "$tun" ]; then
+    # 必须用 printf 传参：bash 3.2 里「变量展开后紧跟中文字符」会截断整串
+    if [ -n "$out" ]; then
+      out=$(printf '%s、TUN 代理（%s）' "$out" "$tun")
+    else
+      out=$(printf 'TUN 代理（%s）' "$tun")
+    fi
+  fi
+  echo "$out"
+}
+
+# 找出被多个接口同时占用的网段（同网段多网卡会让 Bonjour 应答走错网卡）
+dup_subnets() {
+  netstat -rn 2>/dev/null | awk '
+    {
+      # 路由行末尾可能带 ! 标志，接口名要遍历字段找
+      iface = ""
+      for (i = 1; i <= NF; i++) if ($i ~ /^(en|bridge)[0-9]+$/) iface = $i
+      if (iface == "") next
+      if ($2 !~ /^link#/) next                # 只要网段路由，跳过 ARP 主机路由
+      net = $1
+      if (net !~ /^[0-9]+\.[0-9]+/) next      # 只看 IPv4
+      if (net ~ /\//) next                    # 跳过 /32
+      if (net ~ /^(22[4-9]|23[0-9])\./) next   # 跳过组播（224.0.0.251 是 mDNS，所有网卡都有）
+      if (net ~ /^169\.254/) next              # 跳过链路本地（所有网卡都有）
+      key = net SUBSEP iface
+      if (key in seen) next
+      seen[key] = 1
+      list[net] = list[net] " " iface
+      cnt[net]++
+    }
+    END { for (n in list) if (cnt[n] >= 2) print n "|" list[n] }
+  '
 }
 
 ipad_names() {
@@ -170,9 +212,10 @@ cmd_check() {
   rssi=$(echo "$w" | cut -d'|' -f4)
   rate=$(echo "$w" | cut -d'|' -f5)
 
-  local bts aw pid up ipads vpns btrows
+  local bts aw pid up ipads vpns btrows dups
   bts=$(bt_state); aw=$(awdl_state); pid=$(uc_pid)
   up=$(uc_uptime); ipads=$(ipad_names); vpns=$(vpn_active); btrows=$(bt_connected)
+  dups=$(dup_subnets)
 
   [ "$is_tty" = 1 ] && printf "\r\033[K" >&2
 
@@ -222,7 +265,9 @@ cmd_check() {
 
   # 通用控制进程
   if [ -n "$pid" ]; then
-    printf "  %s✓%s %s运行中 · pid %s%s\n" "$GRN" "$RST" "$LD" "$pid" "${up:+ · 已运行 $up}"
+    local upsuf=""
+    if [ -n "$up" ]; then upsuf=" · 已运行 $up"; fi
+    printf "  %s✓%s %s运行中 · pid %s%s\n" "$GRN" "$RST" "$LD" "$pid" "$upsuf"
   else
     printf "  %s!%s %s未运行（按需拉起属正常；若光标跨不过去执行 uc fix）\n" "$YEL" "$RST" "$LD"
   fi
@@ -261,11 +306,23 @@ cmd_check() {
     printf "  %s✓%s 蓝牙负载正常（连接 %s 个设备）\n" "$GRN" "$RST" "${btcount:-0}"
   fi
 
+  # 同网段多网卡
+  if [ -n "$dups" ]; then
+    printf "  %s⚠%s 多个网卡在同一网段，Bonjour 应答可能走错网卡\n" "$YEL" "$RST"
+    printf '%s\n' "$dups" | while IFS='|' read -r net ifs; do
+      [ -z "$net" ] && continue
+      printf "      %s%s→%s %s\n" "$(pad "$net" 15)" "$DIM" "$RST" "$(echo $ifs)"
+    done
+    printf "      %s→ 通用控制靠 Bonjour 发现设备，多路径会导致时好时坏%s\n" "$DIM" "$RST"
+    printf "      %s→ 关掉多余网卡，只留一条到 iPad 所在网络的路径%s\n" "$DIM" "$RST"
+    risks=$((risks+1))
+  fi
+
   # VPN
   if [ -n "$vpns" ]; then
-    printf "  %s⚠%s VPN 已启用：%s\n" "$YEL" "$RST" "$(echo "$vpns" | paste -sd '、' -)"
-    printf "      %s全隧道会切断 awdl0，通用控制 / 随航 / AirDrop 会一起失效%s\n" "$DIM" "$RST"
-    printf "      %s→ 掉线时先关 VPN，或给它开分流白名单%s\n" "$DIM" "$RST"
+    printf "  %s⚠%s VPN 已启用：%s\n" "$YEL" "$RST" "$vpns"
+    printf "      %s会改写默认路由，可能干扰 iCloud 设备发现与点对点链路%s\n" "$DIM" "$RST"
+    printf "      %s→ 掉线时先关掉它试试；或给它开分流，让局域网直连%s\n" "$DIM" "$RST"
     risks=$((risks+1))
   else
     printf "  %s✓%s 未检测到活动的 VPN\n" "$GRN" "$RST"
