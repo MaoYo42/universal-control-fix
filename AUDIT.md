@@ -62,6 +62,24 @@ ls -lt ~/Library/Logs/DiagnosticReports/<AppName>*
 `Process` + 等待退出 = 阻塞。放在 `@objc` 动作里，就是菜单卡住。
 规律：**动作方法（`@objc func doXxx`）里只做「派发到后台 + 回主线程更新」**。
 
+### 6. 看不见的交互要能自证
+
+菜单栏图标的点击、菜单弹没弹出来，这类交互坏了，用户只会说「点了没反应」，
+而真实原因可能是：事件没送到 action、分支判断写反了、菜单弹在屏幕外面、
+或者根本弹了但内容为空。四种情况从外面看一模一样。
+
+`statusItem.menu` 就是个典型陷阱：一旦赋值，AppKit 就把点击拿去掉菜单，
+`button.action` 永远不触发。代码读起来「action 明明写了」，实际是死的。
+这类「接口接上了、被上层吞掉」的问题读代码发现不了。
+
+做法是留一个自检入口，把不可观察的部分变成可打印的：
+
+- 分支判断抽成纯函数（`wantsMenu(_:_:_:)`），用断言跑全组合，不依赖真实点击
+- 弹菜单这种路径真弹一次，用挂到 `.common` 的 `Timer` 在菜单展开期间取样
+  —— main queue 的块在 `NSEventTrackingRunLoopMode` 下不执行，`asyncAfter`
+  在 tracking 循环里是死的，这点第一次写自检时踩过
+- `cancelTracking()` 收尾，外面套一个总超时，避免自检自己挂住
+
 ---
 
 ## 二、发现的问题
@@ -311,6 +329,12 @@ ls ~/Library/Logs/DiagnosticReports/UCMenu* | wc -l   # 数量不应增加
 # 5. 菜单栏程序活着且数据正确
 pgrep -lf "Applications/UCMenu.app/Contents/MacOS/UCMenu"
 ~/Applications/UCMenu.app/Contents/MacOS/UCMenu dump
+
+# 6. 图标点击链路（分支判断 + 菜单真的能弹）
+pkill -f "UCMenu.app/Contents/MacOS/UCMenu"   # 必须先退出，否则自检必假失败
+~/Applications/UCMenu.app/Contents/MacOS/UCMenu selftest
+# 期望：5 条断言全过、菜单展开中 items>0、本次弹出=是、退出码 0
+open ~/Applications/UCMenu.app                # 自检完再拉起来
 ```
 
 ---

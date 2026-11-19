@@ -11,7 +11,7 @@
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.3.3"
+VERSION="1.4.0"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
 

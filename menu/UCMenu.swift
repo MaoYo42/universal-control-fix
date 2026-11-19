@@ -3,8 +3,10 @@
 // 设计要点：
 //   · 菜单打开时**不做任何 IO**，只用后台轮询好的缓存渲染，保证点开即出
 //   · 显示器排列用「快照 + 一键还原」，不做拖拽画布
-//   · 通用控制下的 iPad 不是显示器，无法参与排列；它的逻辑位置只能靠
-//     备份/还原 UniversalControl 的配置（可选，默认关）
+//   · 通用控制下的 iPad 不是显示器，无法参与排列，位置也改不了
+//     （只能看，见 `uc ipad`）
+//   · 图标点击自己接事件：左键＝立刻重新握手，右键/⌥＝弹菜单。
+//     挂 statusItem.menu 的话 AppKit 会吞掉点击、只能弹菜单，所以不挂。
 //
 // 编译：./build.sh
 
@@ -30,6 +32,8 @@ struct Cfg {
     var shortcutOn = ""
     var shortcutOff = ""
     var shortcutState = ""
+    /// restart＝单击图标直接重新握手；menu＝单击只弹菜单
+    var clickAction = "restart"
 }
 
 func loadCfg() -> Cfg {
@@ -45,6 +49,7 @@ func loadCfg() -> Cfg {
         case "shortcut_on": c.shortcutOn = v
         case "shortcut_off": c.shortcutOff = v
         case "shortcut_state": c.shortcutState = v
+        case "click_action": c.clickAction = (v == "menu" ? "menu" : "restart")
         default: break
         }
     }
@@ -173,27 +178,38 @@ struct State {
 
 final class Controller: NSObject, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    /// 自己持有菜单，**不**赋给 statusItem.menu —— 赋了之后点击会被 AppKit
+    /// 直接拿去掉菜单，button 的 action 永远不触发。弹菜单时临时挂一下再摘掉。
+    let menu = NSMenu()
     var cfg = loadCfg()
     var state = State()
     var menuOpen = false
+    /// menuWillOpen 被调用的次数。自检靠它判断菜单到底弹没弹过 ——
+    /// 只看 menuOpen 不行：performClick 直接被忽略时它一直是 false，
+    /// 和「弹了又关掉」分不开。
+    var openCount = 0
     var fastBusy = false
     var slowBusy = false
     var shareBusy = false
     var fastTimer: Timer?
     var slowTimer: Timer?
+    /// 重连进行中：挡住连点，同时让 rebuild 不要抢走图标的临时外观
+    var reconnecting = false
     /// 上一次渲染对应的状态指纹，用来避免每 4 秒无意义地重建整个菜单
     var lastSig = ""
 
     override init() {
         super.init()
+        menu.delegate = self
         if let b = statusItem.button {
             b.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "通用控制")
             b.image?.isTemplate = true
-            b.toolTip = "通用控制"
+            b.toolTip = "通用控制 · 单击重连，右键菜单"
+            // 左右键都要送到 action 里，自己分辨
+            b.target = self
+            b.action = #selector(handleStatusClick)
+            b.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        let m = NSMenu()
-        m.delegate = self
-        statusItem.menu = m
 
         refreshFast()
         refreshSlow()
@@ -208,8 +224,88 @@ final class Controller: NSObject, NSMenuDelegate {
         }
     }
 
+    // ─────────────────────── 图标点击 ───────────────────────
+
+    /// 这次点击该弹菜单还是该重连。抽出来是为了能断言，
+    /// 分支写反的后果是「想重连却弹菜单」或者「想看状态却断了连接」。
+    func wantsMenu(_ type: NSEvent.EventType?,
+                   _ mods: NSEvent.ModifierFlags,
+                   _ action: String) -> Bool {
+        if type == .rightMouseUp { return true }
+        if mods.contains(.control) || mods.contains(.option) { return true }
+        return action != "restart"
+    }
+
+    /// 左键＝立刻重新握手（使用场景就是断连了才点它，不该还要两步）
+    /// 右键 / ⌥ 点击 / 把配置改成 menu＝弹菜单
+    @objc func handleStatusClick() {
+        let e = NSApp.currentEvent
+        if wantsMenu(e?.type, e?.modifierFlags ?? [], cfg.clickAction) {
+            popMenu()
+        } else {
+            quickReconnect()
+        }
+    }
+
+    /// 临时把菜单挂到 statusItem 上再 performClick，AppKit 就会按原生方式
+    /// 把菜单弹在图标下方（含高亮、动画）。performClick 是同步的，返回时
+    /// 菜单已经关掉，所以紧接着摘掉不会影响后续点击。
+    func popMenu() {
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    func setIcon(_ symbol: String, tip: String, dim: Bool?) {
+        guard let b = statusItem.button else { return }
+        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "通用控制")
+        b.image?.isTemplate = true
+        b.toolTip = tip
+        if let d = dim { b.appearsDisabled = d }
+    }
+
+    /// 重新握手：杀掉通用控制进程再拉起来，让 iPad 重新协商一次。
+    ///
+    /// pid 现场用 pgrep 查，不用 state 里的缓存 —— 缓存最多滞后 4 秒，
+    /// 这段时间里进程可能已经被系统重启或用户手动退出了。
+    func quickReconnect() {
+        guard !reconnecting else { return }
+        reconnecting = true
+        // 立刻给反馈：图标换成同步箭头并变暗，否则按下去要等 1 秒多才看得出反应
+        setIcon("arrow.triangle.2.circlepath", tip: "正在重新握手…", dim: true)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (_, pg0) = run("/usr/bin/pgrep", ["-f", kUCPattern], timeout: 3)
+            let pid = pg0.split(separator: "\n").first.map(String.init) ?? ""
+
+            if !pid.isEmpty {
+                run("/bin/kill", ["-9", pid], timeout: 3)
+                Thread.sleep(forTimeInterval: 1.2)
+            }
+            let (_, pg1) = run("/usr/bin/pgrep", ["-f", kUCPattern], timeout: 3)
+            if pg1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                run("/usr/bin/open", ["-a", kUCApp], timeout: 5)
+            }
+
+            DispatchQueue.main.async {
+                self.reconnecting = false
+                let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+                self.setIcon("keyboard", tip: "通用控制 · 最近重连 \(f.string(from: Date()))", dim: false)
+                // 刚拉起来的进程要一两秒才出现，别立刻刷新把自己标成「未运行」
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.refreshFast() }
+            }
+        }
+    }
+
+    @objc func toggleClickAction() {
+        cfg.clickAction = (cfg.clickAction == "restart") ? "menu" : "restart"
+        saveCfgKey("click_action", cfg.clickAction)
+        rebuild(force: true)
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
+        openCount += 1
         rebuild()
         refreshShareState()
     }
@@ -322,18 +418,20 @@ final class Controller: NSObject, NSMenuDelegate {
         s += "|\(state.arrange.hasSnapshot ? 1 : 0)"
         s += "|" + state.arrange.moved.joined(separator: ";")
         s += "|\(cfg.shortcutOn)|\(cfg.shortcutOff)|\(cfg.shortcutState)"
+        s += "|\(cfg.clickAction)"
         s += "|\(FileManager.default.isExecutableFile(atPath: ucBin) ? 1 : 0)"
         return s
     }
 
     func rebuild(force: Bool = false) {
-        guard let menu = statusItem.menu else { return }
+        let menu = self.menu
         let sig = stateSignature()
         if !force && sig == lastSig { return }
         lastSig = sig
 
         menu.removeAllItems()
-        statusItem.button?.appearsDisabled = state.pid.isEmpty
+        // 重连途中图标是同步箭头，别被这里的「未运行」灰显盖掉
+        if !reconnecting { statusItem.button?.appearsDisabled = state.pid.isEmpty }
         let running = !state.pid.isEmpty
 
         menu.addItem(disabled(running ? "通用控制：运行中" : "通用控制：未运行"))
@@ -383,6 +481,14 @@ final class Controller: NSObject, NSMenuDelegate {
         let re = NSMenuItem(title: "重新握手（重启通用控制）", action: #selector(doRestart), keyEquivalent: "r")
         re.target = self
         menu.addItem(re)
+
+        // 单击图标的行为：默认直接重连，关掉之后单击就只是弹菜单
+        let clickItem = NSMenuItem(title: "单击图标直接重连",
+                                   action: #selector(toggleClickAction), keyEquivalent: "")
+        clickItem.target = self
+        clickItem.state = (cfg.clickAction == "restart") ? .on : .off
+        menu.addItem(clickItem)
+        menu.addItem(disabled("  右键或 ⌥ 点击图标，随时打开这个菜单"))
 
         let shareItem = NSMenuItem(title: "共享键鼠", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -473,19 +579,8 @@ final class Controller: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc func doRestart() {
-        // 整条链路都放后台：run() 会阻塞调用线程，放在主线程会让菜单卡住
-        let pid = state.pid
-        DispatchQueue.global(qos: .userInitiated).async {
-            if !pid.isEmpty { run("/bin/kill", ["-9", pid], timeout: 3) }
-            Thread.sleep(forTimeInterval: 1.2)
-            let (_, pg) = run("/usr/bin/pgrep", ["-f", kUCPattern], timeout: 3)
-            if pg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                run("/usr/bin/open", ["-a", kUCApp], timeout: 5)
-            }
-            DispatchQueue.main.async { self.refreshFast() }
-        }
-    }
+    /// 菜单项「重新握手」和图标左键走同一条链路，行为与反馈保持一致
+    @objc func doRestart() { quickReconnect() }
 
     func runShortcut(_ name: String) {
         guard !name.isEmpty else { return }
@@ -621,6 +716,8 @@ func dumpState() {
 
     print("")
     print("iPad 位置：只读，用 uc ipad 查看（命令行改不了）")
+    let clickDesc = (loadCfg().clickAction == "restart") ? "直接重连（右键弹菜单）" : "打开菜单"
+    print("单击图标：\(clickDesc)")
     print("uc 可执行：\(FileManager.default.isExecutableFile(atPath: ucBin) ? ucBin : "找不到")")
 }
 
@@ -641,6 +738,58 @@ struct UCMenuMain {
         if args.count >= 2 && args[1] == "dump" {
             dumpState()
             exit(0)
+        }
+
+        // 自检：验证「临时挂菜单 + performClick」这条路真的能把菜单弹出来。
+        // 弹不出来就是静默失效，光靠肉眼试点击很难判断是没弹还是弹歪了。
+        // 全程有 6 秒兜底，不会挂住。
+        if args.count >= 2 && args[1] == "selftest" {
+            // 同一 bundle id 的第二个实例并存时，performClick 弹不出菜单。
+            // 不提示的话自检会误报「菜单弹不出来」，排查方向全错。
+            let (_, inst) = run("/usr/bin/pgrep", ["-f", "UCMenu.app/Contents/MacOS/UCMenu"], timeout: 2)
+            let n = inst.split(separator: "\n").count
+            if n > 1 {
+                print("⚠ 有 \(n) 个 UCMenu 实例在跑，先全部退出再自检，否则菜单弹不出来")
+            }
+
+            let c = Controller()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 6) {
+                print("selftest 超时（菜单没关掉）")
+                exit(2)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                let cases: [(NSEvent.EventType?, NSEvent.ModifierFlags, String, Bool)] = [
+                    (.leftMouseUp, [], "restart", false),
+                    (.rightMouseUp, [], "restart", true),
+                    (.leftMouseUp, [.option], "restart", true),
+                    (.leftMouseUp, [.control], "restart", true),
+                    (.leftMouseUp, [], "menu", true),
+                ]
+                var bad = 0
+                for (t, m, a, want) in cases {
+                    let got = c.wantsMenu(t, m, a)
+                    if got != want {
+                        bad += 1
+                        print("  ✗ type=\(String(describing: t)) mods=\(m.rawValue) action=\(a) 期望\(want) 实际\(got)")
+                    }
+                }
+                print("点击分支断言：\(bad == 0 ? "全部通过（\(cases.count) 条）" : "\(bad) 条失败")")
+
+                // 菜单跟踪循环跑在 NSEventTrackingRunLoopMode 下，main queue 的
+                // 块这时候不执行。要取样只能用挂到 common modes 的 Timer。
+                let t = Timer(timeInterval: 0.9, repeats: false) { _ in
+                    print("菜单展开中：menuOpen=\(c.menuOpen) items=\(c.menu.numberOfItems)")
+                    c.menu.cancelTracking()
+                }
+                RunLoop.main.add(t, forMode: .common)
+                let before = c.openCount
+                c.popMenu()
+                let opened = c.openCount > before
+                print("菜单已关闭：menuOpen=\(c.menuOpen) 本次弹出=\(opened ? "是" : "否")")
+                exit(opened ? 0 : 3)
+            }
+            app.run()
+            return
         }
 
         let controller = Controller()
