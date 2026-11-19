@@ -11,7 +11,7 @@
 # 设计原则：只用系统真实机制，不模拟点击任何 UI。
 #
 
-VERSION="1.3.2"
+VERSION="1.3.3"
 UC_BIN="/System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl"
 UC_APP="/System/Library/CoreServices/UniversalControl.app"
 
@@ -19,8 +19,6 @@ UC_APP="/System/Library/CoreServices/UniversalControl.app"
 UC_CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uc"
 UC_ARRANGE="$UC_CFG_DIR/arrange.tsv"
 UC_NOAUTO="$UC_CFG_DIR/arrange.noauto"
-UC_UCBLOB="$UC_CFG_DIR/uc-config.plist"
-UC_RESTOREUC="$UC_CFG_DIR/restore-uc"   # 存在 = 还原排列时一并还原 iPad 位置
 
 # launchd 启动时环境变量极简，显式补齐，保证 system_profiler 等能找到
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:$PATH"
@@ -396,17 +394,25 @@ arrange_tsv() {
   "$u" list --tsv 2>/dev/null
 }
 
-# ── 通用控制配置账本 ──
+# ── iPad 逻辑位置：为什么只能看、不能改 ──
 #
-# 通用控制下的 iPad 不是显示器：CGGetOnlineDisplayList 里永远看不到它，
-# 没有 framebuffer、没有 UUID、没有坐标，所以挪不动它。
-# 它挂在显示器哪条边，记录在
-#   ~/Library/Preferences/ByHost/com.apple.universalcontrol.<硬件UUID>.plist
-# 的 Configuration 二进制 blob 里（设备↔显示器 边表）。
-# 单个字段无法直接改写，只能整份备份、整份写回，再让进程重读。
+# 这里曾经有过一套「整份备份 / 写回通用控制 Configuration」的实现，
+# 后来整段删掉了，因为实测证明它没用而且有害：
 #
-# 走 defaults export/import 而不是 cp：写入由 cfprefsd 自己完成，
-# 不会被它的内存缓存覆盖回去，也就不需要 killall cfprefsd。
+#   · 边表 12 小时零变化。期间通用控制断连重连 4 次，边值一个都没动。
+#     说明那张「设备↔显示器」边表记录的是**连接事件历史**，不是位置配置。
+#   · 写回必须重启 UniversalControl 进程才会被重读，而一重启，iPad
+#     断连重连，位置就被重置回 (0,0)——和主屏完全重叠。
+#     等于花钱买罪受：什么都没改，反而把好位置弄没了。
+#
+# iPad 的真实逻辑位置在 WindowServer 的显示配置里：
+#   ~/Library/Preferences/ByHost/com.apple.windowserver.displays.<uuid>.plist
+#   → DisplaySets.Configs[].DisplayConfig[]，条目带 OriginX / OriginY。
+# 但它没有 CGDirectDisplayID，CGConfigureDisplayOrigin 碰不到；
+# 直接改 plist 又要重启 WindowServer（等于注销重登）。
+# 所以结论是：**只能人手动在系统设置里拖，工具能做的是把现状读出来告诉你。**
+#
+# 下面保留的解码能力全部只读，不写任何东西。
 
 ucblob_domain="com.apple.universalcontrol"
 
@@ -419,54 +425,135 @@ ucblob_path() {
   return 1
 }
 
-# 导出当前配置到 $UC_UCBLOB
-ucblob_save() {
-  mkdir -p "$UC_CFG_DIR" 2>/dev/null
-  if ! /usr/bin/defaults -currentHost export "$ucblob_domain" "$UC_UCBLOB" 2>/dev/null; then
-    printf "  %s✗%s 读取通用控制配置失败\n" "$RED" "$RST"
+# 从 WindowServer 的显示配置里读 iPad 的逻辑位置（只读）。
+#
+# iPad 在通用控制下没有 CGDirectDisplayID，CGGetOnlineDisplayList 看不到它，
+# 但 WindowServer 的持久化配置里会留一条带 OriginX/OriginY 的记录。
+# 这条记录只用于「看」：能据此判断系统是不是又把它丢回 (0,0) 和主屏重叠了。
+ipad_position() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf "%s·%s 需要 python3 才能解析显示配置\n" "$DIM" "$RST"
     return 1
   fi
-  local sz; sz=$(wc -c < "$UC_UCBLOB" | tr -d ' ')
-  printf "  %s✓%s 已保存通用控制配置（%s 字节，含 iPad 边表）\n" "$GRN" "$RST" "$sz"
-}
-
-# 把 $UC_UCBLOB 写回系统，并重启通用控制让它重读
-ucblob_restore() {
-  if [ ! -f "$UC_UCBLOB" ]; then
-    printf "  %s·%s 没有通用控制配置快照，跳过 iPad 位置还原\n" "$DIM" "$RST"
-    return 0
-  fi
-  local dst; dst=$(ucblob_path)
-  if [ -z "$dst" ]; then
-    printf "  %s✗%s 找不到通用控制配置文件\n" "$RED" "$RST"
+  local ws
+  ws=$(ls -t "$HOME/Library/Preferences/ByHost/com.apple.windowserver.displays."*.plist 2>/dev/null | head -1)
+  if [ -z "$ws" ]; then
+    printf "%s✗%s 找不到 WindowServer 显示配置\n" "$RED" "$RST"
     return 1
   fi
 
-  # 先留回退，写坏了还能捞回来
-  cp "$dst" "$UC_UCBLOB.bak" 2>/dev/null
+  # 物理屏 UUID（前 8 位）与主屏原点，由 ucdisplay 提供
+  local phys main
+  phys=$(arrange_tsv 2>/dev/null | cut -f1 | tr '\n' ',' | sed 's/,$//')
+  main=$(arrange_tsv 2>/dev/null | awk -F'\t' '$7=="1"{printf "%s,%s,%s,%s",$2,$3,$5,$6; exit}')
 
-  local cur; cur=$(mktemp /tmp/uc-blob.XXXXXX) || return 1
-  /usr/bin/defaults -currentHost export "$ucblob_domain" "$cur" 2>/dev/null
-  if cmp -s "$UC_UCBLOB" "$cur"; then
-    rm -f "$cur"
-    printf "  %s·%s 配置与快照一致，无需写回\n" "$DIM" "$RST"
-    return 0
-  fi
-  rm -f "$cur"
+  printf "\niPad 逻辑位置\n\n"
+  printf "  %s配置文件：%s%s\n" "$DIM" "$(basename "$ws")" "$RST"
 
-  if ! /usr/bin/defaults -currentHost import "$ucblob_domain" "$UC_UCBLOB" 2>/dev/null; then
-    printf "  %s✗%s 写回通用控制配置失败\n" "$RED" "$RST"
-    return 1
-  fi
-  printf "  %s✓%s 已写回配置，重启通用控制让它重读…\n" "$GRN" "$RST"
+  python3 - "$ws" "$phys" "$main" <<'PY'
+import plistlib, sys
+from collections import Counter
 
-  local newpid; newpid=$(reset_uc)
-  if [ -n "$newpid" ]; then
-    printf "  %s✓%s 通用控制已重启（pid %s）\n" "$GRN" "$RST" "$newpid"
-  else
-    printf "  %s⚠%s 通用控制没起来，稍等它会被系统拉起\n" "$YEL" "$RST"
-  fi
-  sleep 1
+ws, phys_s, main_s = sys.argv[1], sys.argv[2], sys.argv[3]
+phys = set(x for x in phys_s.split(',') if x)
+main = None      # (x, y, w, h)
+if main_s and main_s.count(',') == 3:
+    try:
+        a, b, w, h = [float(v) for v in main_s.split(',')]
+        main = (a, b, w, h)
+    except ValueError:
+        main = None
+
+d = plistlib.load(open(ws, 'rb'))
+cfgs = (d.get('DisplaySets') or {}).get('Configs') or []
+
+def origin(x):
+    for key in ('CurrentInfo', 'UnmirrorInfo'):
+        i = x.get(key) or {}
+        if i.get('OriginX') is not None:
+            return i.get('OriginX'), i.get('OriginY')
+    return None
+
+# iPad 条目 = UUID 不在物理屏列表里、且尺寸像 iPad 的那条
+def is_ipad(x):
+    u = (x.get('UUID') or '').upper()
+    if not u: return False
+    if u[:8] in phys: return False
+    o = origin(x)
+    return o is not None
+
+print(f"  历史配置：{len(cfgs)} 条")
+
+# 找「含当前物理屏排列」的那条，看里面有没有 iPad
+cur_cfg = None
+for c in cfgs:
+    dc = c.get('DisplayConfig') or []
+    ids = set((x.get('UUID') or '')[:8].upper() for x in dc if isinstance(x, dict))
+    if phys and ids == phys:
+        cur_cfg = c
+        break
+
+ipads_in_cur = []
+if cur_cfg:
+    ipads_in_cur = [x for x in (cur_cfg.get('DisplayConfig') or []) if isinstance(x, dict) and is_ipad(x)]
+
+print()
+if ipads_in_cur:
+    for x in ipads_in_cur:
+        ox, oy = origin(x)
+        tag = ''
+        if main and (ox, oy) == (main[0], main[1]):
+            tag = '   ← 与主屏完全重叠'
+        print(f"  当前排列里 iPad 在 ({int(ox)}, {int(oy)}){tag}")
+        if tag:
+            print("     这个位置就是它跟着主屏一起动的原因，鼠标在主屏上会直接穿过去。")
+else:
+    print("  当前排列里没有 iPad 条目")
+    print("     · 要么这次连接还没落盘")
+    print("     · 要么通用控制暂时没给它独立位置（下次连接会重新算）")
+
+# 历史位置统计
+# 注意：这里只能靠「UUID 不在当前物理屏列表里」来筛，所以会把其他
+# 已经断开的显示器也算进来（它们同样是 1920x1080）。数字看趋势，
+# 别当成精确的 iPad 历史。
+c = Counter()
+for cfg in cfgs:
+    dc = cfg.get('DisplayConfig') or []
+    ids = set((x.get('UUID') or '')[:8].upper() for x in dc if isinstance(x, dict))
+    # 只统计和「当前物理屏」出现在同一条配置里的非物理屏，过滤掉纯历史设备
+    if phys and not (ids & phys):
+        continue
+    for x in dc:
+        if isinstance(x, dict) and is_ipad(x):
+            o = origin(x)
+            if o: c[(o[0], o[1])] += 1
+
+if c:
+    print()
+    print("  历史上非物理屏条目出现的位置（含 iPad 和其他已断开的显示器）：")
+    for (ox, oy), n in c.most_common(6):
+        note = ''
+        if main:
+            mx, my, mw, mh = main
+            if (ox, oy) == (mx, my):
+                note = '  ⚠ 和主屏重叠'
+            elif ox >= mx + mw * 0.5:
+                note = '  主屏右侧'
+            elif ox <= mx - mw * 0.5:
+                note = '  主屏左侧'
+            elif oy >= my + mh * 0.5:
+                note = '  主屏下方'
+            elif oy <= my - mh * 0.5:
+                note = '  主屏上方'
+        print(f"    ({int(ox):>6}, {int(oy):>6})  {n:>2} 次{note}")
+
+print()
+print("  怎么改：")
+print("    系统设置 → 显示器 → 排列，iPad 连着时会作为第三个方块出现，")
+print("    直接拖到想要的位置。命令行改不了——它没有 displayID，")
+print("    而改配置文件要重启 WindowServer，等于注销重登。")
+print()
+PY
 }
 
 # 任一显示器休眠时输出 yes。休眠状态下 WindowServer 拒绝一切排列变更。
@@ -572,17 +659,11 @@ arrange_show() {
     printf "  %s自动还原：开启（守候模式检测到重连后会自动贴回）%s\n" "$DIM" "$RST"
   fi
 
-  # iPad 逻辑位置账本
-  if [ -f "$UC_UCBLOB" ]; then
-    printf "  %s iPad 位置快照：已保存（%s）%s\n" "$DIM" "$(date -r "$UC_UCBLOB" '+%m-%d %H:%M')" "$RST"
-  else
-    printf "  %s iPad 位置快照：未保存 → %suc arrange save --with-uc%s\n" "$DIM" "$CYA" "$RST"
-  fi
+  printf "  %siPad 的逻辑位置不在显示器排列里，用 %suc ipad%s%s 看%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
   echo
 }
 
 arrange_save() {
-  local withuc="$1"
   local u; u=$(ucd_bin)
   if [ -z "$u" ]; then
     printf "%s✗%s 找不到 ucdisplay 组件，请重新运行 install.sh\n" "$RED" "$RST"
@@ -595,20 +676,11 @@ arrange_save() {
   fi
   local n; n=$(wc -l < "$UC_ARRANGE" | tr -d ' ')
   printf "%s✓%s 已保存 %s 台显示器的排列 → %s\n" "$GRN" "$RST" "$n" "$UC_ARRANGE"
-
-  # iPad 位置一并存进通用控制配置账本
-  if [ "$withuc" = "yes" ]; then
-    ucblob_save
-  fi
-
   printf "  %s以后排列被打乱时，执行 %suc arrange apply%s%s 即可贴回%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
-  if [ "$withuc" != "yes" ]; then
-    printf "  %s想连 iPad 的逻辑位置一起存，加 %s--with-uc%s\n" "$DIM" "$CYA" "$RST"
-  fi
+  printf "  %s只覆盖物理显示器。iPad 的逻辑位置改不了，见 %suc ipad%s%s%s\n" "$DIM" "$CYA" "$RST" "$DIM" "$RST"
 }
 
 arrange_apply() {
-  local withuc="$1"
   local u; u=$(ucd_bin)
   if [ -z "$u" ]; then
     printf "%s✗%s 找不到 ucdisplay 组件，请重新运行 install.sh\n" "$RED" "$RST"
@@ -619,16 +691,6 @@ arrange_apply() {
     return 1
   fi
 
-  # 没显式传参时，看菜单栏程序留下的开关
-  if [ -z "$withuc" ] && [ -f "$UC_RESTOREUC" ]; then withuc="yes"; fi
-
-  # ① iPad 逻辑位置：先做，因为写回配置会重启通用控制
-  if [ "$withuc" = "yes" ]; then
-    printf "正在还原 iPad 逻辑位置…\n"
-    ucblob_restore
-  fi
-
-  # ② 显示器排列
   local plan rc
   plan=$(arrange_plan); rc=$?
   if [ "$rc" = "2" ]; then
@@ -657,13 +719,10 @@ arrange_apply() {
   printf "%s✓%s 已还原 %s 台\n" "$GRN" "$RST" "$ARRANGE_RESTORED"
 }
 
-# iPad 位置账本的独立入口，方便单独验证
+# 只读诊断入口：解码通用控制配置里的边表
 arrange_uc() {
   case "${1:-status}" in
-    save)    ucblob_save ;;
-    restore) ucblob_restore ;;
     edges)   ucblob_edges ;;
-    diff)    ucblob_diff ;;
     *)
       local f; f=$(ucblob_path)
       if [ -n "$f" ]; then
@@ -672,75 +731,10 @@ arrange_uc() {
       else
         printf "%s✗%s 找不到通用控制配置文件\n" "$RED" "$RST"
       fi
-      if [ -f "$UC_UCBLOB" ]; then
-        printf "快照：已保存（%s 字节，%s）\n" \
-          "$(wc -c < "$UC_UCBLOB" | tr -d ' ')" "$(date -r "$UC_UCBLOB" '+%m-%d %H:%M')"
-      else
-        printf "快照：尚未保存 → %suc arrange save --with-uc%s\n" "$CYA" "$RST"
-      fi
-      printf "用法：uc arrange uc [save|restore|edges|diff]\n" ;;
+      printf "用法：uc arrange uc edges   解码「设备↔显示器」边表（只读）\n"
+      printf "      %s这张表是连接事件历史，不是位置配置；iPad 位置看 %suc ipad%s%s\n" \
+        "$DIM" "$CYA" "$RST" "$DIM" ;;
   esac
-}
-
-# 比对快照与当前配置的边表，看「对端→显示器」的最新边值有没有变
-ucblob_diff() {
-  local live; live=$(ucblob_path)
-  if [ -z "$live" ]; then
-    printf "%s✗%s 找不到通用控制配置文件\n" "$RED" "$RST"; return 1
-  fi
-  if [ ! -f "$UC_UCBLOB" ]; then
-    printf "%s✗%s 还没有快照，先执行 %suc arrange uc save%s\n" "$RED" "$RST" "$CYA" "$RST"
-    return 1
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    printf "%s·%s 需要 python3 才能解码边表\n" "$DIM" "$RST"; return 1
-  fi
-  python3 - "$UC_UCBLOB" "$live" <<'PY'
-import plistlib, sys
-
-def load(path):
-    d = plistlib.load(open(path, 'rb'))
-    inner = plistlib.loads(d['Configuration'])
-    newest = {}
-    for node in inner.get('heap', []):
-        for item in node:
-            if not isinstance(item, list) or len(item) != 8:
-                continue
-            ts, kind, sess, dev, peer, disp, e1, e2 = item
-            if not isinstance(ts, int) or not isinstance(sess, str):
-                continue
-            k = (peer, disp)
-            if k not in newest or ts > newest[k][0]:
-                newest[k] = (ts, e1, e2)
-    return newest
-
-snap, live = load(sys.argv[1]), load(sys.argv[2])
-
-def fe(v):
-    if v == 32767: return '无'
-    if v == 65535: return '满'
-    return f'{v/65535*100:.0f}%'
-
-keys = sorted(set(snap) | set(live), key=lambda k: -max(
-    (snap.get(k, (0,))[0], live.get(k, (0,))[0])))
-changed = 0
-for k in keys:
-    s, l = snap.get(k), live.get(k)
-    se = f"{fe(s[1])} / {fe(s[2])}" if s else '（快照无）'
-    le = f"{fe(l[1])} / {fe(l[2])}" if l else '（现在无）'
-    if s and l and s[1:] == l[1:]:
-        continue
-    changed += 1
-    print(f"对端 {k[0][:8]}  →  显示器 {k[1][:8]}")
-    print(f"    快照 {se}")
-    print(f"    现在 {le}")
-
-if changed == 0:
-    print('边表与快照完全一致——说明这段时间里没有任何位置变化被记录。')
-else:
-    print()
-    print(f'共 {changed} 组边表有变化。')
-PY
 }
 
 # 把 Configuration 里的「设备↔显示器」边表摊开成人能看的样子。
@@ -749,9 +743,9 @@ PY
 # 边值是 16 位定点数：32767(0x7FFF) 表示「无 / 居中」，65535(0xFFFF) 表示满。
 ucblob_edges() {
   local src="${1:-}"
-  [ -z "$src" ] && src="$UC_UCBLOB"
-  if [ ! -f "$src" ]; then
-    printf "%s✗%s 没有可解析的文件：%s\n" "$RED" "$RST" "$src"
+  [ -z "$src" ] && src=$(ucblob_path)
+  if [ -z "$src" ] || [ ! -f "$src" ]; then
+    printf "%s✗%s 没有可解析的文件：%s\n" "$RED" "$RST" "${src:-（找不到通用控制配置）}"
     return 1
   fi
   if ! command -v python3 >/dev/null 2>&1; then
@@ -838,20 +832,15 @@ arrange_auto() {
 
 cmd_arrange() {
   local sub="${1:-show}"
-  local withuc="" a
-  for a in "$@"; do
-    [ "$a" = "--with-uc" ] && withuc="yes"
-  done
   case "$sub" in
     show|"")  arrange_show ;;
-    save)     arrange_save "$withuc" ;;
-    apply)    arrange_apply "$withuc" ;;
+    save)     arrange_save ;;
+    apply)    arrange_apply ;;
     auto)     arrange_auto "${2:-}" ;;
     uc)       arrange_uc "${2:-status}" ;;
     *)
       printf "未知子命令：%s\n" "$1" >&2
-      printf "用法：uc arrange [show|save|apply|auto on|off|uc save|uc restore]\n" >&2
-      printf "      %suc arrange apply --with-uc%s  连 iPad 逻辑位置一起还原\n" "$CYA" "$RST" >&2
+      printf "用法：uc arrange [show|save|apply|auto on|off|uc edges]\n" >&2
       return 1 ;;
   esac
 }
@@ -1200,17 +1189,23 @@ usage() {
     uc watch [秒]           守候模式，掉线或排列被打乱时自动恢复（默认 15 秒）
     uc agent on|off         开机自动守候的 launchd 服务
     uc mouse                鼠标在 iPad 上的手感排查（滚轮反向 / 不顺）
+    uc ipad                 iPad 的逻辑位置现在在哪（只读）
     uc arrange save         把当前显示器排列存成快照
     uc arrange apply        把排列贴回快照
     uc arrange              查看排列与快照的差异
     uc arrange auto off     关闭守候时的自动还原
-    uc arrange save --with-uc   连 iPad 位置一起存（实验）
-    uc arrange uc           查看 iPad 位置账本
+    uc arrange uc edges     解码通用控制配置里的边表（只读）
     uc log [分]             查看最近日志（默认 60 分钟）
 
   ${BOLD}关于排列${RST}
     重连、唤醒、插拔显示器之后，macOS 常把副屏「重新居中」甚至丢到主屏外面。
     快照存在 ~/.config/uc/arrange.tsv，还原时会永久写回显示配置。
+
+  ${BOLD}关于 iPad 的位置${RST}
+    通用控制下的 iPad 不是显示器，没有 displayID，命令行改不了它的位置，
+    也不该去写通用控制的配置文件——实测那里面只有连接历史，没有位置，
+    写回还会重启进程把位置重置掉。用 uc ipad 看现状，然后在
+    系统设置 → 显示器 → 排列里手动拖。
 
   ${BOLD}说明${RST}
     只使用系统真实机制，不模拟点击任何界面，不受 macOS 版本更新影响。
@@ -1224,6 +1219,7 @@ case "${1:-check}" in
   fix|reset) cmd_fix ;;
   watch)     cmd_watch "$2" ;;
   mouse)     cmd_mouse ;;
+  ipad)      ipad_position ;;
   agent)     cmd_agent "$2" ;;
   arrange)   shift; cmd_arrange "$@" ;;
   log)       cmd_log "$2" ;;

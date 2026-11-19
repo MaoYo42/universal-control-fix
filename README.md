@@ -98,13 +98,10 @@ launchctl bootout gui/$(id -u)/local.uc.watch   # 本次登录内停止
 | `uc watch [秒]` | 守候模式，**休眠唤醒后自动重置**，并监控 awdl0 / VPN 变化、显示器排列漂移 |
 | `uc arrange save` | 把当前显示器排列存成快照 |
 | `uc arrange apply` | 把排列贴回快照（永久写入，重连后仍保留） |
-| `uc arrange save --with-uc` | 连 iPad 的逻辑位置一起存（实验） |
-| `uc arrange apply --with-uc` | 连 iPad 的逻辑位置一起还原（实验） |
 | `uc arrange` | 查看排列与快照的差异 |
-| `uc arrange uc` | 只看 iPad 位置账本的状态 |
-| `uc arrange uc edges` | 把通用控制配置里的「设备↔显示器」边表解码成人能看的 |
-| `uc arrange uc diff` | 比对快照与当前边表，看位置有没有变 |
 | `uc arrange auto off` | 关闭守候时的自动还原 |
+| `uc ipad` | iPad 的逻辑位置现在被系统放在哪（只读） |
+| `uc arrange uc edges` | 把通用控制配置里的「设备↔显示器」边表解码成人能看的（只读） |
 | `uc log [分]` | 查看最近通用控制日志 |
 | `uc agent on\|off` | 开机自动守候的 launchd 服务 |
 | `uc mouse` | 鼠标在 iPad 上滚轮反向 / 不顺的排查清单 |
@@ -123,7 +120,7 @@ launchctl bootout gui/$(id -u)/local.uc.watch   # 本次登录内停止
      V2511 快照(-1080,-272) 现在(-1080,-350)
   还原排列
   保存当前排列为快照
-  iPad 位置：保存与还原一并处理（实验）
+  iPad 位置（只读）…
 ────────────────────────
 重新握手（重启通用控制）    ⌘R
 共享键鼠                  ▸
@@ -170,45 +167,56 @@ uc arrange apply
 - **显示器休眠时改不了**。WindowServer 会拒绝一切配置变更（错误码 1014）。`uc arrange apply` 会先自动唤醒屏幕；守候模式则跳过，等唤醒后再处理。
 - **水平方向由系统接管**。副屏必须紧贴主屏边缘，X 坐标会被自动夹到 `-1080`；真正能自由调整的是 Y 偏移。
 
-## iPad 的逻辑位置（实验）
+## iPad 的逻辑位置
 
-通用控制下的 iPad **不是显示器**：`CGGetOnlineDisplayList` 永远只返回两台物理屏，它没有 framebuffer、没有 UUID、没有坐标，所以 `ucdisplay` 挪不动它。
+通用控制下的 iPad **不是显示器**：`CGGetOnlineDisplayList` 永远只返回物理屏，它没有 framebuffer、没有 displayID、没有可写的坐标。
 
-它挂在显示器哪条边，记录在
+**结论：这个位置只能人手动拖，工具改不了。** 下面写清楚为什么，以及曾经踩过的坑。
+
+### 位置到底存在哪
+
+在 WindowServer 的显示配置里：
 
 ```
-~/Library/Preferences/ByHost/com.apple.universalcontrol.<硬件UUID>.plist
+~/Library/Preferences/ByHost/com.apple.windowserver.displays.<硬件UUID>.plist
+  → DisplaySets.Configs[].DisplayConfig[]
 ```
 
-的 `Configuration` 二进制 blob 里——一个 `{vers:3, head:UUID, heap:[…]}` 的序列化结构，52 个节点，其中两个嵌套表是「设备 ↔ 显示器」的边表。**没有可读的 `defaults` 键，单个字段改不了**，只能整份导出、整份写回。
+iPad 会作为一条带 `OriginX` / `OriginY` 的记录出现（本机是 `26EE7C3A-…`），和物理屏并列。但它没有 `CGDirectDisplayID`，`CGConfigureDisplayOrigin` 碰不到；直接改 plist 又要重启 WindowServer，等于注销重登。所以没有可行的程序化改法。
 
 ```sh
-uc arrange save --with-uc     # 排列 + iPad 位置一起存
-uc arrange apply --with-uc    # 排列 + iPad 位置一起还原
-uc arrange uc                # 只看账本状态
-uc arrange uc save|restore    # 单独存 / 单独还原
+uc ipad    # 读出来告诉你它现在在哪，以及历史上常被放到哪
 ```
 
-写回走 `defaults -currentHost export/import` 而不是直接 `cp` plist，因为写入由 `cfprefsd` 自己完成，不会被它的内存缓存覆盖回去；写完后重启 `UniversalControl.app` 让它重读配置。每次写回前会先把当前配置留一份 `.bak`。
-
-### 边表长什么样
-
-`Configuration` 解出来是 `{vers:3, head, heap[52], refs}`，其中 8 元列表就是边表：
+典型输出：
 
 ```
-[时间戳, 类型(0/1/3), 会话UUID, 设备UUID, 对端UUID, 显示器UUID, 边值, 边值]
+  当前排列里 iPad 在 (0, 0)   ← 与主屏完全重叠
+     这个位置就是它跟着主屏一起动的原因，鼠标在主屏上会直接穿过去。
+
+  历史上非物理屏条目出现的位置（含 iPad 和其他已断开的显示器）：
+    (     0,      0)  10 次  ⚠ 和主屏重叠
+    (     0,  -1080)   5 次  主屏上方
+    (  1920,      0)   4 次  主屏右侧
+    (     0,   1080)   3 次  主屏下方
 ```
 
-时间戳是**开机以来的单调时钟，单位纳秒**（不是 Unix 时间，直接按秒解释会得到荒唐的 1970 年）。边值是 16 位定点数：`32767`(0x7FFF) 表示那个方向不接，`65535`(0xFFFF) 表示满，其余换算成贴边百分比。
+`(0,0)` 是通用控制的**未初始化默认值**——和主屏坐标完全相同。它一出现，表现就是「iPad 跟着主屏动，鼠标在主屏上会穿过去」。
 
-```sh
-uc arrange uc edges    # 解码出来看
-uc arrange uc diff     # 快照 vs 现在，只列有变化的
-```
+### 怎么改
 
-实测：没有任何拖动时，边表的边值保持稳定，只有时间戳在刷新——所以边值确实是有意义的状态，而不是随机噪声。
+**系统设置 → 显示器 → 排列**，iPad 连着时会作为第三个方块出现，直接拖。
 
-**为什么标「实验」**：blob 里除了边表，还混着会话 UUID 和时间戳。写回一份旧的可能让通用控制认为有个陈旧会话，行为不一定可预期。所以 `uc arrange apply` 不会自动带上它，要显式加 `--with-uc`（或在菜单栏程序里勾上）。守候模式也**永远不碰**这个账本——自动重启通用控制只会把刚连上的连接打断。
+### 曾经写过的「一键还原」为什么删了
+
+1.3.0 到 1.3.2 之间有过一套 `--with-uc`：把通用控制配置（`com.apple.universalcontrol.<uuid>.plist` 里的 `Configuration` blob）整份备份、整份写回，指望能还原 iPad 位置。
+
+**实测证明它没用而且有害，已经整段删除：**
+
+- **边表 12 小时零变化**。期间通用控制断连重连 4 次，边值一个都没动。那张「设备↔显示器」边表记录的是**连接事件历史**，不是位置配置。
+- **写回必须重启 `UniversalControl.app`** 才会被重读。而一重启，iPad 断连重连，位置被重置回 `(0,0)`。等于什么都没改，反而把好位置弄没了。
+
+现在只保留只读解码（`uc arrange uc edges`），不写任何东西。`Configuration` 的结构和解码细节记在 [AUDIT.md](AUDIT.md) 里，万一以后要重新研究有据可查。
 
 ## 鼠标在 iPad 上滚轮反向 / 不顺
 

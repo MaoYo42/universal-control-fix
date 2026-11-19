@@ -14,7 +14,7 @@ macOS 把「连接键盘和鼠标至 …」这个入口藏在「显示器」设�
      V2511 快照(-1080,-272) 现在(-1080,-350)
   还原排列
   保存当前排列为快照
-  iPad 位置：保存与还原一并处理（实验）
+  iPad 位置（只读）…
 ────────────────────────
 重新握手（重启通用控制）    ⌘R
 共享键鼠                  ▸
@@ -68,7 +68,7 @@ x-apple.systempreferences:com.apple.Displays-Settings.extension?sidecarSection
 
 为什么不做拖拽画布：试过一版，每次打开菜单都要同步重建自定义视图，实测明显卡顿，还不如不做。按键式的好处是零渲染开销、状态一眼可见、不会误拖。
 
-**iPad 位置：保存与还原一并处理（实验）** — 见下。
+**iPad 位置（只读）** — 跑 `uc ipad`，告诉你系统把 iPad 放在哪了。见下。
 
 **共享键鼠** — 见下。
 
@@ -120,41 +120,33 @@ App Intent 只能通过「快捷指令」调用，所以需要你手动建两个
 
 要让 iPad 出现在排列里，只有一条路：**用随航（Sidecar）**。那它会变成一个真正的显示器（1180×820@2x），`ucdisplay` 和排列快照就都能管它了。
 
-### 2. iPad 的逻辑位置只能整份备份/还原
+### 2. iPad 的逻辑位置改不了，只能看
 
-iPad 挂在显示器哪条边，记录在
+iPad 在通用控制下没有 displayID，`CGConfigureDisplayOrigin` 碰不到它。位置记在 WindowServer 的显示配置里：
 
 ```
-~/Library/Preferences/ByHost/com.apple.universalcontrol.<硬件UUID>.plist
+~/Library/Preferences/ByHost/com.apple.windowserver.displays.<硬件UUID>.plist
+  → DisplaySets.Configs[].DisplayConfig[]     ← 条目带 OriginX / OriginY
 ```
 
-的 `Configuration` 二进制 blob 里——一个 `{vers:3, head:UUID, heap:[…]}` 的序列化结构，52 个节点，其中两个嵌套表是「设备 ↔ 显示器」的边表。**没有可读的 `defaults` 键，单个字段改不了**，只能整份导出、整份写回。
+直接改这个 plist 要重启 WindowServer，等于注销重登，不值得。
 
-所以「iPad 位置：保存与还原一并处理」这个勾选项做的是：
+菜单里那条 **「iPad 位置（只读）…」** 会跑 `uc ipad`，把当前位置和历史分布摆出来：
 
-```sh
-defaults -currentHost export com.apple.universalcontrol snapshot.plist   # 存
-defaults -currentHost import com.apple.universalcontrol snapshot.plist   # 还原
+```
+  当前排列里 iPad 在 (0, 0)   ← 与主屏完全重叠
+     这个位置就是它跟着主屏一起动的原因，鼠标在主屏上会直接穿过去。
 ```
 
-写回后重启 `UniversalControl.app` 让它重读配置。走 `defaults` 而不是直接 `cp` 文件，是因为写入由 `cfprefsd` 自己完成，不会被它的内存缓存覆盖回去。
+`(0,0)` 是通用控制的**未初始化默认值**，和主屏坐标完全一样。看到它，直接去 **系统设置 → 显示器 → 排列** 把 iPad 拖开。
 
-**为什么标「实验」**：blob 里除了边表，还混着会话 UUID 和时间戳。写回一份旧的可能让通用控制认为有个陈旧会话，行为不一定可预期。所以默认关闭，勾上才生效，并且每次写回前会先把当前配置留一份 `.bak`。
-
-命令行等价物：
-
-```sh
-uc arrange save --with-uc     # 存排列 + 存 iPad 位置
-uc arrange apply --with-uc    # 还原排列 + 还原 iPad 位置
-uc arrange uc                # 只看 iPad 位置账本的状态
-uc arrange uc save|restore    # 单独存 / 单独还原
-```
+> 这里以前是个「保存与还原一并处理」的勾选项，1.3.3 删了。它写回的是通用控制的 `Configuration` blob，实测那张「设备↔显示器」边表是**连接事件历史**，不含位置（12 小时零变化，期间重连 4 次）；而且写回必须重启 `UniversalControl.app`，一重启 iPad 位置就被重置回 `(0,0)`。既没用又有害。
 
 ### 3. 「连接键盘和鼠标至 "V" 的 iPad」不能程序化触发
 
 系统那 11 个 App Intent 里只有全局的 `ShareKeyboard`，没有按设备连接的。App 的 `CFBundleURLTypes` 是空的，也没有命令行参数。想硬啃就得逆向 UC 的私有 XPC 协议（`com.apple.universalcontrol.ui` 等），不划算。
 
-所以这个程序能给你的是：**总开关 + 强制重新握手 + 一键直达设置页 + 排列快照还原 + iPad 位置账本**。点一下自动连上某台 iPad，系统没留这个口子。
+所以这个程序能给你的是：**总开关 + 强制重新握手 + 一键直达设置页 + 排列快照还原 + iPad 位置只读查看**。点一下自动连上某台 iPad，系统没留这个口子。
 
 ### 4. 主屏不能拖动
 

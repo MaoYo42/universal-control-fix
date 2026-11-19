@@ -22,7 +22,6 @@ let home = NSHomeDirectory() as NSString
 let cfgDir = home.appendingPathComponent(".config/uc")
 let cfgFile = (cfgDir as NSString).appendingPathComponent("menu.conf")
 let arrangeFile = (cfgDir as NSString).appendingPathComponent("arrange.tsv")
-let restoreUCFlag = (cfgDir as NSString).appendingPathComponent("restore-uc")
 let ucBin = home.appendingPathComponent("bin/uc")
 
 // ─────────────────────────── 配置 ───────────────────────────
@@ -170,7 +169,6 @@ struct State {
     var shareOn: Int?
     var shortcuts = Set<String>()
     var arrange = ArrangeDiff()
-    var restoreUC = false
 }
 
 final class Controller: NSObject, NSMenuDelegate {
@@ -246,13 +244,11 @@ final class Controller: NSObject, NSMenuDelegate {
                 }
             }
 
-            let restoreUC = FileManager.default.fileExists(atPath: restoreUCFlag)
 
             DispatchQueue.main.async {
                 self.state.pid = pid
                 self.state.ledger = ledger
                 self.state.arrange = diffArrangement()   // 主线程，NSScreen 安全
-                self.state.restoreUC = restoreUC
                 self.fastBusy = false
                 if !self.menuOpen { self.rebuild() }
             }
@@ -321,7 +317,7 @@ final class Controller: NSObject, NSMenuDelegate {
     /// 但会白白制造对象和两次 stat 系统调用，而且会让菜单有细微抖动。
     func stateSignature() -> String {
         var s = "\(state.pid)|\(state.ipad)|\(state.shareOn.map(String.init) ?? "-")"
-        s += "|\(state.restoreUC ? 1 : 0)|\(state.shortcuts.count)"
+        s += "|\(state.shortcuts.count)"
         s += "|\(state.ledger?.timeIntervalSince1970 ?? 0)"
         s += "|\(state.arrange.hasSnapshot ? 1 : 0)"
         s += "|" + state.arrange.moved.joined(separator: ";")
@@ -373,13 +369,13 @@ final class Controller: NSObject, NSMenuDelegate {
         save.isEnabled = FileManager.default.isExecutableFile(atPath: ucBin)
         menu.addItem(save)
 
-        // 这个开关同时影响「保存」和「还原」——没有 iPad 位置快照就无从还原，
-        // 所以标题必须写清楚，不能只说「还原时」
-        let ucToggle = NSMenuItem(title: "  iPad 位置：保存与还原一并处理（实验）",
-                                  action: #selector(toggleRestoreUC), keyEquivalent: "")
-        ucToggle.target = self
-        ucToggle.state = state.restoreUC ? .on : .off
-        menu.addItem(ucToggle)
+        // iPad 的逻辑位置改不了，只能看。点开把 uc ipad 的输出摆出来。
+        // 以前这里是个「保存与还原一并处理」的勾选项，已经删了：
+        // 写回通用控制配置既不改位置，又会重启进程把位置重置掉。
+        let ipadItem = NSMenuItem(title: "  iPad 位置（只读）…", action: #selector(showIPadPosition), keyEquivalent: "")
+        ipadItem.target = self
+        ipadItem.isEnabled = FileManager.default.isExecutableFile(atPath: ucBin)
+        menu.addItem(ipadItem)
 
         // ── 通用控制 ──
         menu.addItem(.separator())
@@ -445,31 +441,36 @@ final class Controller: NSObject, NSMenuDelegate {
     // ─────────────────────── 动作 ───────────────────────
 
     @objc func doRestoreArrangement() {
-        var args = ["arrange", "apply"]
-        if state.restoreUC { args.append("--with-uc") }
         DispatchQueue.global().async {
-            run(ucBin, args, timeout: 30)
+            run(ucBin, ["arrange", "apply"], timeout: 30)
             DispatchQueue.main.async { self.refreshFast() }
         }
     }
 
     @objc func doSaveArrangement() {
-        var args = ["arrange", "save"]
-        if state.restoreUC { args.append("--with-uc") }
         DispatchQueue.global().async {
-            run(ucBin, args, timeout: 15)
+            run(ucBin, ["arrange", "save"], timeout: 15)
             DispatchQueue.main.async { self.refreshFast() }
         }
     }
 
-    @objc func toggleRestoreUC() {
-        try? FileManager.default.createDirectory(atPath: cfgDir, withIntermediateDirectories: true)
-        if state.restoreUC {
-            try? FileManager.default.removeItem(atPath: restoreUCFlag)
-        } else {
-            FileManager.default.createFile(atPath: restoreUCFlag, contents: Data())
+    /// iPad 的位置在 WindowServer 的显示配置里，没有 displayID，改不了。
+    /// 这里只把 `uc ipad` 的输出原样摆出来，让用户知道它现在被系统放在哪。
+    @objc func showIPadPosition() {
+        DispatchQueue.global().async {
+            let (_, out) = run(ucBin, ["ipad"], timeout: 15)
+            let text = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                let a = NSAlert()
+                a.messageText = "iPad 的逻辑位置"
+                a.informativeText = text.isEmpty ? "没读到数据。可以在终端执行 uc ipad 看详细原因。" : text
+                a.addButton(withTitle: "知道了")
+                a.addButton(withTitle: "打开显示器设置")
+                if a.runModal() == .alertSecondButtonReturn {
+                    NSWorkspace.shared.open(URL(string: kSettingsURL)!)
+                }
+            }
         }
-        refreshFast()
     }
 
     @objc func doRestart() {
@@ -619,8 +620,7 @@ func dumpState() {
     }
 
     print("")
-    print("iPad 位置账本：\(FileManager.default.fileExists(atPath: (cfgDir as NSString).appendingPathComponent("uc-config.plist")) ? "已保存" : "未保存")")
-    print("还原时一并恢复 iPad：\(FileManager.default.fileExists(atPath: restoreUCFlag) ? "开" : "关")")
+    print("iPad 位置：只读，用 uc ipad 查看（命令行改不了）")
     print("uc 可执行：\(FileManager.default.isExecutableFile(atPath: ucBin) ? ucBin : "找不到")")
 }
 

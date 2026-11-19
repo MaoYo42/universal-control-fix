@@ -210,20 +210,63 @@ SIGTERM → 等 1 秒 → 还在就 SIGKILL。
 
 ---
 
-### P3 — 菜单项标题与实际行为不符
+### P0 — 基于错误假设实现的功能：写回通用控制配置「还原 iPad 位置」
 
-「还原时一并恢复 iPad 位置」这个开关实际同时控制**保存**和**还原**
-（没有 iPad 位置快照就无从还原）。标题只提了还原，用户勾上后去点保存，
-会以为只存了显示器，实际也存了 iPad 位置。
+**现象**
+
+1.3.0 加了 `--with-uc`：整份备份 `com.apple.universalcontrol.<uuid>.plist`
+的 `Configuration` blob，需要时整份写回，指望把 iPad 的逻辑位置还原。
+菜单里对应一个「保存与还原一并处理（实验）」的勾选项。
+
+**它错在哪**
+
+两个独立的错误叠在一起：
+
+1. **那张表不是位置配置。** `Configuration` 解出来是
+   `{vers:3, head, heap[52], refs}`，其中 8 元列表是
+   `[时间戳, 类型(0/1/3), 会话UUID, 设备UUID, 对端UUID, 显示器UUID, 边值, 边值]`。
+   实测 12 小时里通用控制断连重连 4 次（守候日志有记录），边值一个都没动。
+   它是**连接事件历史**，不是位置。
+2. **写回必须重启进程。** `defaults import` 之后要 kill
+   `UniversalControl.app` 才会被重读。一重启，iPad 断连重连，
+   位置被重置成 `(0,0)`——和主屏完全重叠，鼠标在主屏上会直接穿过去。
+
+所以这个功能的实际效果是：什么都没改，还把好位置弄没了。
+
+**位置到底在哪**
+
+WindowServer 的显示配置里：
+
+```
+~/Library/Preferences/ByHost/com.apple.windowserver.displays.<uuid>.plist
+  → DisplaySets.Configs[].DisplayConfig[]
+```
+
+iPad 在里面有完整坐标（本机 UUID `26EE7C3A-…`，和物理屏并列，带
+`OriginX`/`OriginY`/`Wide`/`High`/`Rotation`）。但它没有
+`CGDirectDisplayID`，`CGConfigureDisplayOrigin` 碰不到；直接改 plist
+又要重启 WindowServer（等于注销重登）。**结论：只能人手动拖。**
 
 **修法**
 
-改名「iPad 位置：保存与还原一并处理」。
+整段删除。只保留只读解码（`uc arrange uc edges`），并新增 `uc ipad`
+读 WindowServer 配置报告当前位置和历史分布。菜单里的勾选项换成
+「iPad 位置（只读）…」。
 
 **教训**
 
-> 一个开关控制两件事时，标题必须两件都提。
-> 只描述其中一半，用户的心智模型就是错的。
+> 不要因为「技术上做得到」就当成「功能有效」。
+> 写回一份二进制配置能跑通、能验证字节级一致，不等于它改变了系统行为。
+> 验证必须落在**用户可观察的结果**上：位置变了吗？没变就是没用。
+
+> 一个功能如果有副作用，而这个副作用恰好会破坏它想修复的东西，
+> 那它注定是负收益。设计时就要问：为了让新配置生效，我需要付出什么代价？
+> 这个代价会不会抵消收益？这里的代价是重启进程，而重启进程正是位置重置的原因。
+
+> 「实验性」标签不是免责声明。用户勾上它，就是相信它能用。
+
+> 判断一份二进制配置是「配置」还是「日志」，看它会不会随状态变化。
+> 不变的就是历史，变了才可能是配置。这条比逆出完整结构快得多。
 
 ---
 
@@ -254,6 +297,11 @@ UC_DISPLAY=/usr/bin/false uc                  # 期望体检里标 ⚠ 而不是
 uc arrange                                    # 期望能列出差异或「一致」
 uc arrange apply                              # 期望 rc=0
 uc mouse                                      # 期望打印 iPad 侧排查清单
+uc ipad                                       # 期望打印 iPad 当前位置，rc=0
+
+# 4. 不许再有会重启通用控制的「还原」路径
+grep -rn "with-uc\|ucblob_restore\|reset_uc" uc menu/UCMenu.swift
+# 期望：只有 uc fix / 重新握手 会调 reset_uc，arrange 链路里一个都不许有
 
 # 4. 升级不产生崩溃日志
 ls ~/Library/Logs/DiagnosticReports/UCMenu* | wc -l
@@ -277,3 +325,10 @@ pgrep -lf "Applications/UCMenu.app/Contents/MacOS/UCMenu"
 - `uc watch` 的自动还原每触发一次都会 `--permanent` 写一次显示配置，
   `com.apple.windowserver.displays.*.plist` 里的历史记录会持续增长。
   现在有 60 秒稳定判定 + 600 秒冷却兜着，但长期跑还是要观察。
+- **iPad 的逻辑位置仍然只能手动拖。** `uc ipad` 只读，能告诉你它被放在哪、
+  是不是又回到 `(0,0)` 和主屏重叠了，但改不了。理论上的路径有两条，
+  都不划算：① 逆向 `CGSConfigureDisplayOrigin` 之类的私有 API，看能不能
+  用一个「没有 displayID 的 UUID」配置；② 直接改 windowserver 的 plist
+  再重启 WindowServer（等于注销重登）。如果以后真要试，先确认改完
+  iPad 位置会不会被系统在下一次连接时覆盖掉——这次的教训就是
+  「写进去了」不等于「生效了」。

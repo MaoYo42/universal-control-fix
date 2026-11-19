@@ -21,7 +21,7 @@ APP="$BUILD/UCMenu.app"
 DEST="$HOME/Applications/UCMenu.app"
 PLIST="$HOME/Library/LaunchAgents/local.uc.menu.plist"
 LABEL="local.uc.menu"
-VERSION="1.3.2"
+VERSION="1.3.3"
 
 uninstall() {
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
