@@ -831,7 +831,18 @@ arrange_auto() {
 }
 
 cmd_arrange() {
-  local sub="${1:-show}"
+  local sub="${1:-show}" a
+  # --with-uc 在 1.3.3 删了。老文档、老脚本、肌肉记忆都可能还带着它，
+  # 不能静默忽略——那会让人以为「还原了 iPad 位置」，其实什么都没做。
+  for a in "$@"; do
+    if [ "$a" = "--with-uc" ]; then
+      printf "%s·%s --with-uc 已移除：写回通用控制配置不会改变 iPad 位置，\n" "$YEL" "$RST"
+      printf "  而且写回要重启通用控制，反而会把它重置回 (0,0)。\n"
+      printf "  %s用 %suc ipad%s%s 看当前位置，在系统设置 → 显示器 → 排列里手动拖%s\n" \
+        "$DIM" "$CYA" "$RST" "$DIM" "$RST"
+      break
+    fi
+  done
   case "$sub" in
     show|"")  arrange_show ;;
     save)     arrange_save ;;
